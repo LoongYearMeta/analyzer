@@ -1,0 +1,691 @@
+// go run chain_analyzer.go -h1=917000 -h2=917696 -browser
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"html/template"
+	"io"
+	"math"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"time"
+)
+
+// ==================== 默认配置 ====================
+var defaultConfig = struct {
+	Node string
+	User string
+	Pass string
+}{
+	Node: "http://127.0.0.1:8332",
+	User: "username",
+	Pass: "randompasswd",
+}
+
+// ==================== 结构体 ====================
+type Config struct {
+	H1   int
+	H2   int
+	Node string
+	User string
+	Pass string
+}
+
+type RPCRequest struct {
+	JSONRPC string        `json:"jsonrpc"`
+	Method  string        `json:"method"`
+	Params  []interface{} `json:"params"`
+	ID      int           `json:"id"`
+}
+
+type RPCResponse struct {
+	Result json.RawMessage `json:"result"`
+	Error  *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+	ID int `json:"id"`
+}
+
+type BlockHeader struct {
+	Time int64 `json:"time"`
+}
+
+type Point struct {
+	X    int     `json:"x"`
+	Y    float64 `json:"y"`
+	Diff int64   `json:"diff"`
+	Time string  `json:"time"`
+	Zero bool    `json:"zero"`
+}
+
+func main() {
+	cfg := Config{
+		Node: defaultConfig.Node,
+		User: defaultConfig.User,
+		Pass: defaultConfig.Pass,
+	}
+
+	flag.IntVar(&cfg.H1, "h1", 0, "起始高度")
+	flag.IntVar(&cfg.H2, "h2", 0, "结束高度")
+	flag.StringVar(&cfg.Node, "node", cfg.Node, "RPC 节点地址")
+	flag.StringVar(&cfg.User, "user", cfg.User, "RPC 用户名")
+	flag.StringVar(&cfg.Pass, "pass", cfg.Pass, "RPC 密码")
+	var browser bool
+	flag.BoolVar(&browser, "browser", false, "自动打开浏览器")
+	flag.Parse()
+
+	if cfg.H1 >= cfg.H2 || cfg.H1 < 0 {
+		fmt.Println("用法: go run chain_analyzer.go -h1=917000 -h2=917696")
+		return
+	}
+
+	fmt.Printf("正在分析区块 %d → %d...\n", cfg.H1, cfg.H2)
+
+	timestamps, err := getBlockTimestamps(cfg)
+	if err != nil {
+		fmt.Printf("错误: %v\n", err)
+		return
+	}
+
+	// === 1. 计算所有间隔（包含 0）===
+	diffs := make([]int64, len(timestamps)-1)
+	for i := 1; i < len(timestamps); i++ {
+		diffs[i-1] = timestamps[i] - timestamps[i-1]
+	}
+
+	// === 2. 基础统计（包含 0 间隔）===
+	totalDuration := timestamps[len(timestamps)-1] - timestamps[0]
+	intervalCount := int64(len(diffs))
+	avgInterval := float64(totalDuration) / float64(intervalCount)
+	ratePerHour := float64(intervalCount) * 3600 / float64(totalDuration)
+
+	// 正值用于最长/众数
+	var positiveDiffs []int64
+	for _, d := range diffs {
+		if d > 0 {
+			positiveDiffs = append(positiveDiffs, d)
+		}
+	}
+	maxDiff := int64(0)
+	if len(positiveDiffs) > 0 {
+		maxDiff = max(positiveDiffs)
+	}
+	mode := findMode(diffs)
+
+	// === 3. 终端速率曲线图（归一化+偏移）===
+	drawRateChart(diffs, timestamps, cfg.H1, cfg.H2)
+
+	// === 4. 智能速率区间分析 ===
+	report := smartRateAnalysis(diffs, avgInterval, timestamps, cfg.H1)
+
+	// === 5. 输出报告 ===
+	printSmartReport(cfg.H1, cfg.H2, totalDuration, avgInterval, ratePerHour, maxDiff, mode, report)
+
+	// === 6. 生成 HTML 报告（归一化+只点）===
+	htmlPath := generateHTMLReport(cfg.H1, cfg.H2, timestamps, diffs, avgInterval)
+	fmt.Printf("HTML 报告已生成：%s\n", htmlPath)
+
+	if browser {
+		_ = openBrowser("file://" + htmlPath)
+	}
+}
+
+// ====================== 终端图 ======================
+func drawRateChart(diffs []int64, timestamps []int64, h1, h2 int) {
+	const width = 80
+	const height = 15
+	chart := make([][]rune, height)
+	for i := range chart {
+		chart[i] = make([]rune, width)
+		for j := range chart[i] {
+			chart[i][j] = ' '
+		}
+	}
+
+	// ---------- 归一化 ----------
+	var rates []float64
+	for _, d := range diffs {
+		if d <= 0 {
+			rates = append(rates, 1e9) // 0 秒先占位
+		} else {
+			rates = append(rates, 3600.0/float64(d))
+		}
+	}
+	// 只对非 0 秒做 min-max
+	var pos []float64
+	for _, r := range rates {
+		if r < 1e9 {
+			pos = append(pos, r)
+		}
+	}
+	sort.Float64s(pos)
+	minR, maxR := 0.0, 1000.0
+	if len(pos) > 0 {
+		minR = pos[0]
+		maxR = pos[len(pos)-1]
+	}
+	rangeR := maxR - minR
+	if rangeR == 0 {
+		rangeR = 1
+	}
+	// 归一化后 0 秒显示值
+	zeroY := 110.0 // 100 + 10
+
+	// ---------- 绘制 ----------
+	for i, d := range diffs {
+		x := i * (width - 1) / len(diffs)
+		var yNorm float64
+		if d <= 0 {
+			yNorm = zeroY
+		} else {
+			r := 3600.0 / float64(d)
+			yNorm = (r - minR) / rangeR * 100.0
+		}
+		y := int((100.0 - yNorm) / 100.0 * float64(height-2))
+		if y < 0 {
+			y = 0
+		}
+		if y >= height-1 {
+			y = height - 2
+		}
+		char := '█'
+		if d <= 0 {
+			char = '*'
+		}
+		chart[y][x] = char
+	}
+
+	// ---------- X 轴四个中位点 ----------
+	positions := []int{0, width / 4, width / 2, 3 * width / 4, width - 1}
+	for _, x := range positions {
+		heightVal := h1 + (h2-h1)*x/(width-1)
+		label := fmt.Sprintf("%d", heightVal)
+		start := x - len(label)/2
+		if start < 0 {
+			start = 0
+		}
+		if start+len(label) > width {
+			start = width - len(label)
+		}
+		copy(chart[height-1][start:], []rune(label))
+	}
+
+	fmt.Printf("\n出块速率曲线图 (归一化 0-100，0秒偏移至 110)\n")
+	fmt.Printf("※ '*' = 0 秒出块（高出 10）\n")
+	for _, row := range chart {
+		fmt.Printf("%s\n", string(row))
+	}
+	fmt.Printf("↑ 高速率 ← 时间 → ↓ 低速率\n")
+}
+
+// ====================== HTML 报告 ======================
+func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, avgInterval float64) string {
+	var data []Point
+	var colors []string
+
+	// ---------- 1. 计算非 0 秒的速率并取平方根 ----------
+	var posRates []float64
+	var sqrtRates []float64
+	for _, d := range diffs {
+		if d > 0 {
+			r := 3600.0 / float64(d)
+			posRates = append(posRates, r)
+			sqrtRates = append(sqrtRates, math.Sqrt(r))
+		}
+	}
+	sort.Float64s(sqrtRates)
+	minSqrt, maxSqrt := 0.0, 1.0
+	if len(sqrtRates) > 0 {
+		minSqrt = sqrtRates[0]
+		maxSqrt = sqrtRates[len(sqrtRates)-1]
+	}
+	rangeSqrt := maxSqrt - minSqrt
+	if rangeSqrt == 0 {
+		rangeSqrt = 1
+	}
+
+	// ---------- 计算平均速率的 sqrt 归一化 Y ----------
+	avgRate := 3600.0 / avgInterval
+	avgSqrt := math.Sqrt(avgRate)
+	avgY := (avgSqrt - minSqrt) / rangeSqrt * 100.0
+
+	// ---------- 2. 构造点（使用 sqrt 归一化）----------
+	zeroY := 110.0 // 0 秒偏移
+	for i := 1; i < len(timestamps); i++ {
+		diff := diffs[i-1]
+		isZero := diff <= 0
+		var y float64
+		if isZero {
+			y = zeroY
+		} else {
+			r := 3600.0 / float64(diff)
+			sqrtR := math.Sqrt(r)
+			y = (sqrtR - minSqrt) / rangeSqrt * 100.0
+		}
+		color := getColor(diff, avgInterval)
+		colors = append(colors, color)
+
+		data = append(data, Point{
+			X:    h1 + i,
+			Y:    y,
+			Diff: diff,
+			Time: formatTime(timestamps[i]),
+			Zero: isZero,
+		})
+	}
+
+	totalDuration := timestamps[len(timestamps)-1] - timestamps[0]
+	ratePerHour := float64(len(diffs)) * 3600 / float64(totalDuration)
+
+	// ---------- X 轴中位点 ----------
+	minX := h1 + 1
+	maxX := h2
+	stepSize := float64(maxX-minX) / 4
+
+	const htmlTemplate = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>出块速率分析报告 [{{.H1}} → {{.H2}}]</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body{font-family:system-ui,sans-serif;margin:20px;background:#f9f9fb;}
+    .container{max-width:1200px;margin:auto;background:white;padding:20px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.1);}
+    h1{color:#2c3e50;text-align:center;}
+    .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0;}
+    .stat{background:#eef5ff;padding:15px;border-radius:8px;text-align:center;}
+    .stat strong{display:block;font-size:1.5em;color:#3498db;}
+    canvas{border:1px solid #ddd;border-radius:8px;margin:20px 0;}
+    .footer{text-align:center;margin-top:30px;color:#7f8c8d;font-size:0.9em;}
+    .legend{margin:10px 0;font-size:0.9em;color:#e74c3c;}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>出块速率分析报告 [{{.H1}} → {{.H2}}]</h1>
+
+    <div class="stats">
+      <div class="stat"><strong>{{.BlockCount}}</strong> 总区块数</div>
+      <div class="stat"><strong>{{.Duration}}</strong> 总时长</div>
+      <div class="stat"><strong>{{printf "%.2f" .AvgInterval}} 秒</strong> 平均出块时间</div>
+      <div class="stat"><strong>{{printf "%.2f" .RatePerHour}} 块/小时</strong> 出块速率</div>
+    </div>
+
+    <div class="legend">Warning: 红色星号 = 0 秒出块（归一化后 100 + 10）</div>
+
+    <canvas id="rateChart" width="1200" height="360"></canvas>
+
+    <div class="footer">生成时间: {{.Now}} | 工具: chain_analyzer (Go)</div>
+  </div>
+
+  <script>
+    const ctx = document.getElementById('rateChart').getContext('2d');
+    const data = {{.JSONData}};
+    const colors = {{.Colors}};
+    const zeroY = {{.ZeroY}};
+    const avgY = {{.AvgY}};
+    const minSqrt = {{.MinSqrt}};
+    const maxSqrt = {{.MaxSqrt}};
+
+    new Chart(ctx, {
+      type: 'scatter',
+      data: {
+        datasets: [
+          {
+            type: 'line',
+            label: '平均出块速率',
+            data: [{x: {{.MinX}}, y: avgY}, {x: {{.MaxX}}, y: avgY}],
+            borderColor: '#27ae60',
+            borderDash: [6, 4],
+            borderWidth: 2,
+            pointRadius: 0,
+            fill: false
+          },
+          {
+            label: '出块速率 (√归一化)',
+            data: data,
+            backgroundColor: ctx => ctx.raw.zero ? '#e74c3c' : colors[ctx.dataIndex],
+            pointRadius: ctx => ctx.raw.zero ? 7 : 3,
+            pointStyle: ctx => ctx.raw.zero ? 'star' : 'circle',
+            pointHoverRadius: ctx => ctx.raw.zero ? 10 : 5,
+            showLine: false
+          }
+        ]
+      },
+      options: {
+        responsive: false,
+        maintainAspectRatio: false,
+		animation: { duration: 0 },
+        plugins: {
+          tooltip: {
+            callbacks: {
+              title: ctx => '高度: ' + ctx[0].parsed.x,
+              label: ctx => {
+                const r = ctx.raw;
+                if (ctx.datasetIndex === 0) {
+                  return [
+                    '平均出块时间: {{printf "%.2f" .AvgInterval}} 秒',
+                    '归一化 Y: ' + avgY.toFixed(1)
+                  ];
+                }
+                if (r.zero) {
+                  return [
+                    'Warning: 0 秒出块！',
+                    '显示值: ' + zeroY.toFixed(1),
+                    '实际间隔: 0 秒',
+                    '时间: ' + r.time
+                  ];
+                } else {
+                  const sqrtY = r.y / 100 * (maxSqrt - minSqrt) + minSqrt;
+                  const realRate = sqrtY * sqrtY;
+                  return [
+                    '归一化(√): ' + r.y.toFixed(1),
+                    '实际速率: ' + realRate.toFixed(2) + ' 块/小时',
+                    '间隔: ' + r.diff + ' 秒',
+                    '时间: ' + r.time
+                  ];
+                }
+              }
+            }
+          },
+          title: {display:true, text:'出块速率（√归一化 0-100，0 秒偏移）', font:{size:13}}
+        },
+        scales: {
+          x: {
+            type: 'linear',
+            min: {{.MinX}},
+            max: {{.MaxX}},
+            title: {display:true, text:'区块高度'},
+            ticks: {
+              stepSize: {{.StepSize}},
+              callback: v => Math.round(v),
+              font: {size: 10}
+            },
+            grid: {lineWidth: 0.5}
+          },
+          y: {
+            title: {display:true, text:'归一化速率 (√)'},
+            min: 0,
+            max: 120,
+            ticks: {
+              font: {size: 10}
+            },
+            grid: {lineWidth: 0.5}
+          }
+        }
+      }
+    });
+  </script>
+</body>
+</html>
+`
+
+	type TemplateData struct {
+		H1          int
+		H2          int
+		BlockCount  int
+		Duration    string
+		AvgInterval float64
+		RatePerHour float64
+		JSONData    template.JS
+		Colors      template.JS
+		ZeroY       float64
+		AvgY        float64
+		MinSqrt     float64 // 新增
+		MaxSqrt     float64 // 新增
+		MinX        int
+		MaxX        int
+		StepSize    float64
+		Now         string
+	}
+
+	tmpl := template.Must(template.New("report").Funcs(template.FuncMap{
+		"printf": fmt.Sprintf,
+	}).Parse(htmlTemplate))
+
+	jsonData, _ := json.Marshal(data)
+	jsonColors, _ := json.Marshal(colors)
+
+	dir, _ := os.UserCacheDir()
+	if dir == "" {
+		dir = "."
+	}
+	path := filepath.Join(dir, fmt.Sprintf("chain_report_%d_%d.html", h1, h2))
+	f, _ := os.Create(path)
+	defer f.Close()
+
+	_ = tmpl.Execute(f, TemplateData{
+		H1:          h1,
+		H2:          h2,
+		BlockCount:  h2 - h1 + 1,
+		Duration:    (time.Duration(totalDuration) * time.Second).String(),
+		AvgInterval: avgInterval,
+		RatePerHour: ratePerHour,
+		JSONData:    template.JS(jsonData),
+		Colors:      template.JS(jsonColors),
+		ZeroY:       zeroY,
+		AvgY:        avgY,
+		MinSqrt:     minSqrt,
+		MaxSqrt:     maxSqrt,
+		MinX:        minX,
+		MaxX:        maxX,
+		StepSize:    stepSize,
+		Now:         time.Now().Format("2006-01-02 15:04:05"),
+	})
+
+	return path
+}
+
+// ====================== 其余不变 ======================
+func getColor(diff int64, avg float64) string {
+	if diff <= 0 {
+		return "#e74c3c"
+	}
+	ratio := float64(diff) / avg
+	if ratio <= 0.5 {
+		return "#e74c3c"
+	} else if ratio <= 1.5 {
+		return "#27ae60"
+	}
+	return "#3498db"
+}
+
+func openBrowser(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start()
+}
+
+// ----------------- RPC & 统计 -----------------
+func getBlockTimestamps(cfg Config) ([]int64, error) {
+	timestamps := make([]int64, 0, cfg.H2-cfg.H1+1)
+	client := &http.Client{Timeout: 30 * time.Second}
+	for height := cfg.H1; height <= cfg.H2; height++ {
+		hash, err := rpcCall(cfg, client, "getblockhash", []interface{}{height})
+		if err != nil {
+			return nil, fmt.Errorf("getblockhash %d: %w", height, err)
+		}
+		headerJSON, err := rpcCall(cfg, client, "getblockheader", []interface{}{hash})
+		if err != nil {
+			return nil, fmt.Errorf("getblockheader %s: %w", hash, err)
+		}
+		var header BlockHeader
+		if err := json.Unmarshal(headerJSON, &header); err != nil {
+			return nil, fmt.Errorf("解析 header: %w", err)
+		}
+		timestamps = append(timestamps, header.Time)
+		if (height-cfg.H1)%100 == 0 {
+			fmt.Printf("已处理 %d 个区块...\n", height-cfg.H1+1)
+		}
+	}
+	return timestamps, nil
+}
+
+func rpcCall(cfg Config, client *http.Client, method string, params []interface{}) (json.RawMessage, error) {
+	req := RPCRequest{JSONRPC: "2.0", Method: method, Params: params, ID: 1}
+	body, _ := json.Marshal(req)
+	httpReq, _ := http.NewRequest("POST", cfg.Node, bytes.NewBuffer(body))
+	httpReq.SetBasicAuth(cfg.User, cfg.Pass)
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("连接失败: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	bodyStr := string(respBody)
+	if resp.StatusCode == 401 {
+		return nil, fmt.Errorf("认证失败 (401): 用户名/密码错误")
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(bodyStr, 200))
+	}
+	var rpcResp RPCResponse
+	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
+		return nil, fmt.Errorf("JSON 解析失败: %w\n%s", err, truncate(bodyStr, 500))
+	}
+	if rpcResp.Error != nil {
+		return nil, fmt.Errorf("RPC 错误 [%d]: %s", rpcResp.Error.Code, rpcResp.Error.Message)
+	}
+	return rpcResp.Result, nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+func max(data []int64) int64 {
+	if len(data) == 0 {
+		return 0
+	}
+	m := data[0]
+	for _, v := range data {
+		if v > m {
+			m = v
+		}
+	}
+	return m
+}
+
+func findMode(data []int64) int64 {
+	count := make(map[int64]int)
+	for _, v := range data {
+		count[v]++
+	}
+	maxCount := 0
+	mode := int64(0)
+	for v, c := range count {
+		if c > maxCount {
+			maxCount = c
+			mode = v
+		}
+	}
+	return mode
+}
+
+func formatTime(ts int64) string {
+	return time.Unix(ts, 0).Format("2006-01-02 15:04:05")
+}
+
+// ====================== 智能分析（保持不变） ======================
+func smartRateAnalysis(diffs []int64, avgInterval float64, timestamps []int64, startHeight int) string {
+	if len(diffs) < 10 {
+		return "数据不足，无法分析"
+	}
+	rates := make([]float64, len(diffs))
+	for i, d := range diffs {
+		if d <= 0 {
+			rates[i] = 1e9
+		} else {
+			rates[i] = 3600.0 / float64(d)
+		}
+	}
+	sort.Float64s(rates)
+	n := len(rates)
+	highThresh := rates[n*7/10]
+	lowThresh := rates[n*3/10]
+
+	highStart, highEnd, highCount := findLongestRateStreak(rates, timestamps, func(r float64) bool {
+		return r >= highThresh
+	})
+	lowStart, lowEnd, lowCount := findLongestRateStreak(rates, timestamps, func(r float64) bool {
+		return r <= lowThresh && r < 1e9
+	})
+
+	total := len(diffs)
+	highPct := float64(highCount) / float64(total) * 100
+	lowPct := float64(lowCount) / float64(total) * 100
+
+	var lines []string
+	if highPct >= 50 {
+		dur := float64(timestamps[highEnd] - timestamps[highStart])
+		rate := float64(highCount) / (dur / 3600)
+		lines = append(lines, fmt.Sprintf(
+			"高密度出块期: %.1f%% 区块集中在 %s ~ %s (每小时 %.1f 块)",
+			highPct, formatTime(timestamps[highStart]), formatTime(timestamps[highEnd]), rate,
+		))
+	}
+	if lowPct >= 50 {
+		dur := float64(timestamps[lowEnd] - timestamps[lowStart])
+		rate := float64(lowCount) / (dur / 3600)
+		lines = append(lines, fmt.Sprintf(
+			"极稀疏出块期: %.1f%% 区块分布在 %s ~ %s (每小时 %.1f 块)",
+			lowPct, formatTime(timestamps[lowStart]), formatTime(timestamps[lowEnd]), rate,
+		))
+	}
+	if len(lines) == 0 {
+		return "出块速率分布均匀"
+	}
+	return strings.Join(lines, "\n")
+}
+
+func findLongestRateStreak(rates []float64, timestamps []int64, condition func(float64) bool) (start, end, count int) {
+	maxLen := 0
+	bestStart, bestEnd := 0, 0
+	for i := 0; i < len(rates); i++ {
+		if condition(rates[i]) {
+			j := i + 1
+			for j < len(rates) && condition(rates[j]) {
+				j++
+			}
+			if j-i > maxLen {
+				maxLen = j - i
+				bestStart = i
+				bestEnd = j
+			}
+			i = j
+		}
+	}
+	return bestStart, bestEnd, maxLen
+}
+
+func printSmartReport(h1, h2 int, total int64, avgInterval, ratePerHour float64, maxDiff, mode int64, smart string) {
+	fmt.Printf("出块时间分析报告 [%d → %d]\n", h1, h2)
+	fmt.Printf("总区块数: %d\n", h2-h1+1)
+	fmt.Printf("总时长: %s\n", time.Duration(total)*time.Second)
+	fmt.Printf("平均出块时间: %.2f 秒\n", avgInterval)
+	fmt.Printf("出块速率: %.2f 块/小时\n", ratePerHour)
+	fmt.Printf("最长出块: %s\n", time.Duration(maxDiff)*time.Second)
+	fmt.Printf("最常见间隔: %s\n", time.Duration(mode)*time.Second)
+	fmt.Printf("\n智能速率分析:\n%s\n", smart)
+}
