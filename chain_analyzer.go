@@ -39,6 +39,30 @@ type Config struct {
 	Pass string
 }
 
+// ==================== 日志文件 ====================
+var logFile *os.File
+
+func initLog() error {
+	var err error
+	logFile, err = os.OpenFile("analyzer.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("无法创建日志文件: %w", err)
+	}
+	return nil
+}
+
+func logf(format string, args ...interface{}) {
+	if logFile != nil {
+		fmt.Fprintf(logFile, format+"\n", args...)
+	}
+}
+
+func closeLog() {
+	if logFile != nil {
+		logFile.Close()
+	}
+}
+
 type RPCRequest struct {
 	JSONRPC string        `json:"jsonrpc"`
 	Method  string        `json:"method"`
@@ -86,6 +110,14 @@ func main() {
 	if cfg.H1 >= cfg.H2 || cfg.H1 < 0 {
 		fmt.Println("用法: go run chain_analyzer.go -h1=917000 -h2=917696")
 		return
+	}
+
+	// 初始化日志文件
+	if err := initLog(); err != nil {
+		fmt.Printf("警告: %v\n", err)
+	} else {
+		defer closeLog()
+		fmt.Println("日志文件已创建: analyzer.log")
 	}
 
 	fmt.Printf("正在分析区块 %d → %d...\n", cfg.H1, cfg.H2)
@@ -453,18 +485,31 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, avgInterval float
 		"printf": fmt.Sprintf,
 	}).Parse(htmlTemplate))
 
-	jsonData, _ := json.Marshal(data)
-	jsonColors, _ := json.Marshal(colors)
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		fmt.Printf("警告: JSON 数据序列化失败: %v\n", err)
+	}
+	jsonColors, err := json.Marshal(colors)
+	if err != nil {
+		fmt.Printf("警告: 颜色数据序列化失败: %v\n", err)
+	}
 
-	dir, _ := os.UserCacheDir()
-	if dir == "" {
+	dir, err := os.UserCacheDir()
+	if err != nil || dir == "" {
 		dir = "."
+		fmt.Printf("警告: 无法获取缓存目录，使用当前目录: %v\n", err)
 	}
 	path := filepath.Join(dir, fmt.Sprintf("chain_report_%d_%d.html", h1, h2))
-	f, _ := os.Create(path)
+	fmt.Printf("正在生成 HTML 报告到: %s\n", path)
+	
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Printf("错误: 无法创建文件 %s: %v\n", path, err)
+		return path
+	}
 	defer f.Close()
 
-	_ = tmpl.Execute(f, TemplateData{
+	err = tmpl.Execute(f, TemplateData{
 		H1:          h1,
 		H2:          h2,
 		BlockCount:  h2 - h1 + 1,
@@ -482,6 +527,12 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, avgInterval float
 		StepSize:    stepSize,
 		Now:         time.Now().Format("2006-01-02 15:04:05"),
 	})
+	
+	if err != nil {
+		fmt.Printf("错误: 模板执行失败: %v\n", err)
+	} else {
+		fmt.Printf("HTML 报告生成成功\n")
+	}
 
 	return path
 }
@@ -531,6 +582,14 @@ func getBlockTimestamps(cfg Config) ([]int64, error) {
 			return nil, fmt.Errorf("解析 header: %w", err)
 		}
 		timestamps = append(timestamps, header.Time)
+		
+		// === 记录高度 + 时间戳 到 analyzer.log ===
+		logf("高度: %d | 时间: %s (Unix: %d)",
+			height,
+			time.Unix(header.Time, 0).Format("2006-01-02 15:04:05"),
+			header.Time,
+		)
+		
 		if (height-cfg.H1)%100 == 0 {
 			fmt.Printf("已处理 %d 个区块...\n", height-cfg.H1+1)
 		}
