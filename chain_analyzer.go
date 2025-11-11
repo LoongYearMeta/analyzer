@@ -1,4 +1,4 @@
-// go run chain_analyzer.go -h1=917000 -h2=917696 -browser
+// go run chain_analyzer.go -h1=917000 -h2=917696 -browser -yaxis=interval
 package main
 
 import (
@@ -107,10 +107,18 @@ func main() {
 	flag.StringVar(&cfg.Pass, "pass", cfg.Pass, "RPC 密码")
 	var browser bool
 	flag.BoolVar(&browser, "browser", false, "自动打开浏览器")
+	var yaxis string
+	flag.StringVar(&yaxis, "yaxis", "interval", "Y轴类型: interval(时间间隔) 或 rate(出块速率)")
 	flag.Parse()
 
 	if cfg.H1 >= cfg.H2 || cfg.H1 < 0 {
-		fmt.Println("用法: go run chain_analyzer.go -h1=917000 -h2=917696")
+		fmt.Println("用法: go run chain_analyzer.go -h1=917000 -h2=917696 [-yaxis=interval|rate]")
+		return
+	}
+
+	// 验证 yaxis 参数
+	if yaxis != "interval" && yaxis != "rate" {
+		fmt.Printf("错误: yaxis 参数必须是 'interval' 或 'rate'，当前值: %s\n", yaxis)
 		return
 	}
 
@@ -167,20 +175,48 @@ func main() {
 	modes := findModes(diffs)
 	positiveModes := findModes(positiveDiffs)
 
-	// === 3. 统一平方根归一化（只计算一次）===
-	normalizedData, minSqrt, maxSqrt := normalizeSqrtRate(diffs)
-
-	// === 4. 终端速率曲线图 ===
-	drawRateChart(normalizedData, timestamps, cfg.H1, cfg.H2)
-
-	// === 5. 智能速率区间分析 ===
-	report := smartRateAnalysis(diffs, avgInterval, timestamps, cfg.H1)
-
-	// === 6. 输出报告 ===
-	printSmartReport(cfg.H1, cfg.H2, totalDuration, avgInterval, ratePerHour, maxDiff, modes, positiveModes, negativeCount, negativeTotalTime, report)
-
-	// === 7. 生成 HTML 报告 ===
-	htmlPath := generateHTMLReport(cfg.H1, cfg.H2, timestamps, diffs, normalizedData, avgInterval, minSqrt, maxSqrt)
+	// === 3. 根据 yaxis 参数选择不同的数据处理 ===
+	var htmlPath string
+	
+	if yaxis == "interval" {
+		// ========== 模式1：时间间隔模式 ==========
+		// 对时间间隔进行开平方归一化
+		intervalData, minSqrt, maxSqrt, maxInterval := normalizeSqrt(diffs, func(d int64) float64 {
+			return float64(d) // 时间间隔本身
+		})
+		
+		// 终端图表
+		drawIntervalChart(intervalData, timestamps, cfg.H1, cfg.H2, int64(maxInterval))
+		
+		// 智能分析
+		report := smartRateAnalysis(diffs, avgInterval, timestamps, cfg.H1)
+		
+		// 输出报告
+		printSmartReport(cfg.H1, cfg.H2, totalDuration, avgInterval, ratePerHour, maxDiff, modes, positiveModes, negativeCount, negativeTotalTime, report)
+		
+		// 生成 HTML 报告
+		htmlPath = generateHTMLReportInterval(cfg.H1, cfg.H2, timestamps, diffs, intervalData, avgInterval, int64(maxInterval), minSqrt, maxSqrt)
+		
+	} else {
+		// ========== 模式2：出块速率模式 ==========
+		// 对出块速率进行开平方归一化
+		normalizedData, minSqrt, maxSqrt, maxRate := normalizeSqrt(diffs, func(d int64) float64 {
+			return 3600.0 / float64(d) // 速率 = 3600 / 间隔
+		})
+		
+		// 终端图表
+		drawRateChart(normalizedData, timestamps, cfg.H1, cfg.H2)
+		
+		// 智能分析
+		report := smartRateAnalysis(diffs, avgInterval, timestamps, cfg.H1)
+		
+		// 输出报告
+		printSmartReport(cfg.H1, cfg.H2, totalDuration, avgInterval, ratePerHour, maxDiff, modes, positiveModes, negativeCount, negativeTotalTime, report)
+		
+		// 生成 HTML 报告
+		htmlPath = generateHTMLReportRate(cfg.H1, cfg.H2, timestamps, diffs, normalizedData, avgInterval, maxRate, minSqrt, maxSqrt)
+	}
+	
 	fmt.Printf("HTML 报告已生成：%s\n", htmlPath)
 
 	if browser {
@@ -188,47 +224,53 @@ func main() {
 	}
 }
 
-// ====================== 统一归一化函数 ======================
-// normalizeSqrtRate 使用平方根变换进行归一化
-// 关键：d <= 0 的数据用 110.0 占位，不参与 min/max 计算，但保持索引对应
-func normalizeSqrtRate(diffs []int64) (normalized []float64, minSqrt, maxSqrt float64) {
-	// 1. 只收集正常数据的 sqrt(rate) 用于计算 min/max
-	var sqrtRates []float64
+// ====================== 通用开平方归一化函数 ======================
+// normalizeSqrt 对输入数据进行开平方归一化到0-100
+// valueFunc: 从 diff 计算实际值的函数（例如：间隔本身，或速率 3600/diff）
+// 返回：归一化后的数据，minSqrt, maxSqrt, maxValue
+func normalizeSqrt(diffs []int64, valueFunc func(int64) float64) (normalized []float64, minSqrt, maxSqrt, maxValue float64) {
+	maxValue = 0.0
+	
+	// 1. 收集正常数据的平方根
+	var sqrtValues []float64
 	for _, d := range diffs {
 		if d > 0 {
-			r := 3600.0 / float64(d)
-			sqrtRates = append(sqrtRates, math.Sqrt(r))
+			v := valueFunc(d)
+			sqrtValues = append(sqrtValues, math.Sqrt(v))
+			if v > maxValue {
+				maxValue = v
+			}
 		}
 	}
 	
-	// 2. 计算正常数据的范围
-	sort.Float64s(sqrtRates)
+	// 2. 计算平方根的范围
+	sort.Float64s(sqrtValues)
 	minSqrt, maxSqrt = 0.0, 1.0
-	if len(sqrtRates) > 0 {
-		minSqrt = sqrtRates[0]
-		maxSqrt = sqrtRates[len(sqrtRates)-1]
+	if len(sqrtValues) > 0 {
+		minSqrt = sqrtValues[0]
+		maxSqrt = sqrtValues[len(sqrtValues)-1]
 	}
 	rangeSqrt := maxSqrt - minSqrt
 	if rangeSqrt == 0 {
 		rangeSqrt = 1
 	}
 	
-	// 3. 归一化所有数据（包括异常值）
+	// 3. 归一化所有数据
 	normalized = make([]float64, len(diffs))
 	for i, d := range diffs {
 		if d <= 0 {
-			normalized[i] = 110.0 // 异常值占位：100 + 10
+			normalized[i] = 110.0 // 异常值标记：100 + 10
 		} else {
-			r := 3600.0 / float64(d)
-			sqrtR := math.Sqrt(r)
-			normalized[i] = (sqrtR - minSqrt) / rangeSqrt * 100.0
+			v := valueFunc(d)
+			sqrtV := math.Sqrt(v)
+			normalized[i] = (sqrtV - minSqrt) / rangeSqrt * 100.0
 		}
 	}
 	
-	return normalized, minSqrt, maxSqrt
+	return normalized, minSqrt, maxSqrt, maxValue
 }
 
-// ====================== 终端图 ======================
+// ====================== 终端图 (速率模式) ======================
 func drawRateChart(normalizedData []float64, timestamps []int64, h1, h2 int) {
 	const width = 80
 	const height = 15
@@ -300,49 +342,125 @@ func drawRateChart(normalizedData []float64, timestamps []int64, h1, h2 int) {
 	fmt.Printf("↑ 高速率 ← 时间 → ↓ 低速率\n")
 }
 
-// ====================== HTML 报告 ======================
-func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []float64, avgInterval, minSqrt, maxSqrt float64) string {
+// ====================== 终端图 (时间间隔模式) ======================
+func drawIntervalChart(intervalData []float64, timestamps []int64, h1, h2 int, maxInterval int64) {
+	const width = 80
+	const height = 15
+	chart := make([][]rune, height)
+	for i := range chart {
+		chart[i] = make([]rune, width)
+		for j := range chart[i] {
+			chart[i][j] = ' '
+		}
+	}
+
+	// ---------- 计算时间范围（x轴：时间轴）----------
+	minTime := timestamps[0]
+	maxTime := timestamps[len(timestamps)-1] + 180 // 最后一个块 + 3分钟
+	timeRange := maxTime - minTime
+	
+	// ---------- 绘制（使用时间间隔作为y轴）----------
+	for i, interval := range intervalData {
+		// 计算每个点在时间轴上的位置
+		pointTime := timestamps[i+1] // intervalData[i] 对应第 i+1 个块
+		x := int(float64(pointTime-minTime) / float64(timeRange) * float64(width-1))
+		if x < 0 {
+			x = 0
+		}
+		if x >= width {
+			x = width - 1
+		}
+		
+		// Y轴：归一化间隔（0-100），越大越慢，显示在上方
+		var y int
+		if interval >= 110.0 {
+			// 异常值显示在顶部
+			y = 0
+		} else {
+			// 正常值：归一化值越大，y越小（显示在上方）
+			y = int(float64(height-2) * (1.0 - interval/100.0))
+			if y < 0 {
+				y = 0
+			}
+			if y >= height-1 {
+				y = height - 2
+			}
+		}
+		
+		// 异常值用星号标记
+		char := '█'
+		if interval >= 110.0 {
+			char = '*'
+		}
+		chart[y][x] = char
+	}
+
+	// ---------- X 轴刻度：显示时间 ----------
+	positions := []int{0, width / 4, width / 2, 3 * width / 4, width - 1}
+	for _, x := range positions {
+		// 计算该位置对应的时间戳
+		timestamp := minTime + int64(float64(timeRange)*float64(x)/float64(width-1))
+		// 格式化为简短时间（月-日 时:分）
+		t := time.Unix(timestamp, 0)
+		label := t.Format("01-02 15:04")
+		
+		start := x - len(label)/2
+		if start < 0 {
+			start = 0
+		}
+		if start+len(label) > width {
+			start = width - len(label)
+		}
+		copy(chart[height-1][start:], []rune(label))
+	}
+
+	fmt.Printf("\n出块时间间隔图 (√归一化 0-100，最大值 %d秒)\n", maxInterval)
+	fmt.Printf("※ '*' = 异常出块（0秒或负数，偏移至 110） | X轴：时间轴\n")
+	for _, row := range chart {
+		fmt.Printf("%s\n", string(row))
+	}
+	fmt.Printf("↑ 慢出块 ← 时间 → ↓ 快出块\n")
+}
+
+// ====================== HTML 报告 (时间间隔模式) ======================
+func generateHTMLReportInterval(h1, h2 int, timestamps, diffs []int64, intervalData []float64, avgInterval float64, maxInterval int64, minSqrt, maxSqrt float64) string {
 	var data []Point
 	var colors []string
 
-	// ---------- 计算平均速率的归一化 Y ----------
-	avgRate := 3600.0 / avgInterval
-	avgSqrt := math.Sqrt(avgRate)
-	rangeSqrt := maxSqrt - minSqrt
-	if rangeSqrt == 0 {
-		rangeSqrt = 1
-	}
-	avgY := (avgSqrt - minSqrt) / rangeSqrt * 100.0
-
-	// ---------- 构造点（使用时间轴）----------
+	// ---------- 构造点（使用归一化间隔）----------
 	for i := 1; i < len(timestamps); i++ {
 		diff := diffs[i-1]
-		y := normalizedData[i-1]
+		interval := intervalData[i-1]  // 已经是归一化的0-110
 		isZero := diff <= 0
 		color := getColor(diff, avgInterval)
 		colors = append(colors, color)
 
 		data = append(data, Point{
 			X:      timestamps[i],           // X轴：时间戳
-			Y:      y,
-			Diff:   diff,
+			Y:      interval,                // Y轴：归一化间隔（0-110）
+			Diff:   diff,                    // 实际间隔（秒）
 			Time:   formatTime(timestamps[i]),
-			Height: h1 + i,                  // 保留区块高度用于tooltip
+			Height: h1 + i,
 			Zero:   isZero,
 		})
 	}
 
 	totalDuration := timestamps[len(timestamps)-1] - timestamps[0]
 	ratePerHour := float64(len(diffs)) * 3600 / float64(totalDuration)
-
-	// ---------- 常量定义 ----------
-	const zeroY = 110.0 // 异常值显示位置
+	
+	// ---------- 计算平均间隔的开平方归一化值 ----------
+	rangeSqrt := maxSqrt - minSqrt
+	if rangeSqrt == 0 {
+		rangeSqrt = 1
+	}
+	sqrtAvgInterval := math.Sqrt(avgInterval)
+	avgIntervalNorm := (sqrtAvgInterval - minSqrt) / rangeSqrt * 100.0
 
 	// ---------- X 轴范围：时间轴 ----------
 	minX := timestamps[0]
-	maxX := timestamps[len(timestamps)-1] + 180 // 最后一个块 + 3分钟
+	maxX := timestamps[len(timestamps)-1] + 180
 	timeRange := maxX - minX
-	stepSize := float64(timeRange) / 6 // 分成6段，显示更多刻度
+	stepSize := float64(timeRange) / 6
 
 	const htmlTemplate = `
 <!DOCTYPE html>
@@ -374,7 +492,270 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []
       <div class="stat"><strong>{{printf "%.2f" .RatePerHour}} 块/小时</strong> 出块速率</div>
     </div>
 
-    <div class="legend">Warning: 红色星号 = 异常出块（0秒或负数，归一化后 100 + 10）</div>
+    <div class="legend">Warning: 红色星号 = 异常出块（0秒或负数） | Y轴：归一化间隔（√变换 0-100，最大 {{.MaxInterval}}秒）</div>
+
+    <canvas id="rateChart" width="1200" height="360"></canvas>
+
+    <div class="footer">生成时间: {{.Now}} | 工具: chain_analyzer (Go)</div>
+  </div>
+
+  <script>
+    const ctx = document.getElementById('rateChart').getContext('2d');
+    const data = {{.JSONData}};
+    const colors = {{.Colors}};
+    const avgInterval = {{printf "%.2f" .AvgInterval}};
+    const avgIntervalNorm = {{printf "%.2f" .AvgIntervalNorm}};
+    const maxInterval = {{.MaxInterval}};
+    const minSqrt = {{.MinSqrt}};
+    const maxSqrt = {{.MaxSqrt}};
+
+    new Chart(ctx, {
+      type: 'scatter',
+      data: {
+        datasets: [
+          {
+            type: 'line',
+            label: '平均出块时间',
+            data: [{x: {{.MinX}}, y: avgIntervalNorm}, {x: {{.MaxX}}, y: avgIntervalNorm}],
+            borderColor: '#27ae60',
+            borderDash: [6, 4],
+            borderWidth: 2,
+            pointRadius: 0,
+            fill: false
+          },
+          {
+            label: '出块时间间隔（归一化）',
+            data: data,
+            backgroundColor: ctx => ctx.raw.zero ? '#e74c3c' : colors[ctx.dataIndex],
+            pointRadius: ctx => ctx.raw.zero ? 7 : 3,
+            pointStyle: ctx => ctx.raw.zero ? 'star' : 'circle',
+            pointHoverRadius: ctx => ctx.raw.zero ? 10 : 5,
+            showLine: false
+          }
+        ]
+      },
+      options: {
+        responsive: false,
+        maintainAspectRatio: false,
+		animation: { duration: 0 },
+        plugins: {
+          tooltip: {
+            callbacks: {
+              title: ctx => {
+                const r = ctx[0].raw;
+                return '高度: ' + r.height + ' | 时间: ' + r.time;
+              },
+              label: ctx => {
+                const r = ctx.raw;
+                if (ctx.datasetIndex === 0) {
+                  return '平均出块时间: ' + avgInterval + ' 秒 (归一化: ' + avgIntervalNorm.toFixed(1) + ')';
+                }
+                if (r.zero) {
+                  return [
+                    'Warning: 异常出块！',
+                    '实际间隔: ' + r.diff + ' 秒'
+                  ];
+                } else {
+                  // 从开平方归一化反算实际间隔
+                  const sqrtInterval = r.y / 100 * (maxSqrt - minSqrt) + minSqrt;
+                  const realInterval = sqrtInterval * sqrtInterval;
+                  const rate = 3600 / realInterval;
+                  return [
+                    '归一化(√): ' + r.y.toFixed(1),
+                    '实际间隔: ' + realInterval.toFixed(0) + ' 秒',
+                    '相当于: ' + rate.toFixed(2) + ' 块/小时'
+                  ];
+                }
+              }
+            }
+          },
+          title: {display:true, text:'出块时间间隔（√归一化 0-100，最大 ' + maxInterval + '秒） | X轴：时间轴', font:{size:13}}
+        },
+        scales: {
+          x: {
+            type: 'linear',
+            min: {{.MinX}},
+            max: {{.MaxX}},
+            title: {display:true, text:'时间'},
+            ticks: {
+              stepSize: {{.StepSize}},
+              callback: v => {
+                const d = new Date(v * 1000);
+                return d.getMonth()+1 + '-' + d.getDate() + ' ' + 
+                       String(d.getHours()).padStart(2,'0') + ':' + 
+                       String(d.getMinutes()).padStart(2,'0');
+              },
+              font: {size: 10}
+            },
+            grid: {lineWidth: 0.5}
+          },
+          y: {
+            title: {display:true, text:'归一化时间间隔'},
+            min: 0,
+            max: 120,
+            ticks: {
+              font: {size: 10}
+            },
+            grid: {lineWidth: 0.5}
+          }
+        }
+      }
+    });
+  </script>
+</body>
+</html>
+`
+
+	type TemplateData struct {
+		H1              int
+		H2              int
+		BlockCount      int
+		Duration        string
+		AvgInterval     float64
+		AvgIntervalNorm float64     // 归一化的平均间隔
+		RatePerHour     float64
+		JSONData        template.JS
+		Colors          template.JS
+		MinX            int64       // X轴最小值（时间戳）
+		MaxX            int64       // X轴最大值（时间戳）
+		StepSize        float64
+		MaxInterval     int64       // 最大间隔（秒）
+		MinSqrt         float64     // 平方根最小值
+		MaxSqrt         float64     // 平方根最大值
+		Now             string
+	}
+
+	tmpl := template.Must(template.New("report").Funcs(template.FuncMap{
+		"printf": fmt.Sprintf,
+	}).Parse(htmlTemplate))
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		fmt.Printf("警告: JSON 数据序列化失败: %v\n", err)
+	}
+	jsonColors, err := json.Marshal(colors)
+	if err != nil {
+		fmt.Printf("警告: 颜色数据序列化失败: %v\n", err)
+	}
+
+	dir, err := os.UserCacheDir()
+	if err != nil || dir == "" {
+		dir = "."
+		fmt.Printf("警告: 无法获取缓存目录，使用当前目录: %v\n", err)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("chain_report_%d_%d.html", h1, h2))
+	fmt.Printf("正在生成 HTML 报告到: %s\n", path)
+	
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Printf("错误: 无法创建文件 %s: %v\n", path, err)
+		return path
+	}
+	defer f.Close()
+
+	err = tmpl.Execute(f, TemplateData{
+		H1:              h1,
+		H2:              h2,
+		BlockCount:      h2 - h1 + 1,
+		Duration:        (time.Duration(totalDuration) * time.Second).String(),
+		AvgInterval:     avgInterval,
+		AvgIntervalNorm: avgIntervalNorm,
+		RatePerHour:     ratePerHour,
+		JSONData:        template.JS(jsonData),
+		Colors:          template.JS(jsonColors),
+		MinX:            minX,
+		MaxX:            maxX,
+		StepSize:        stepSize,
+		MaxInterval:     maxInterval,
+		MinSqrt:         minSqrt,
+		MaxSqrt:         maxSqrt,
+		Now:             time.Now().Format("2006-01-02 15:04:05"),
+	})
+	
+	if err != nil {
+		fmt.Printf("错误: 模板执行失败: %v\n", err)
+	} else {
+		fmt.Printf("HTML 报告生成成功\n")
+	}
+
+	return path
+}
+
+// ====================== HTML 报告 (出块速率模式) ======================
+func generateHTMLReportRate(h1, h2 int, timestamps, diffs []int64, normalizedData []float64, avgInterval, maxRate, minSqrt, maxSqrt float64) string {
+	var data []Point
+	var colors []string
+
+	// ---------- 计算平均速率的开平方归一化 Y ----------
+	avgRate := 3600.0 / avgInterval
+	rangeSqrt := maxSqrt - minSqrt
+	if rangeSqrt == 0 {
+		rangeSqrt = 1
+	}
+	avgSqrt := math.Sqrt(avgRate)
+	avgRateNorm := (avgSqrt - minSqrt) / rangeSqrt * 100.0
+
+	// ---------- 构造点（使用归一化速率）----------
+	for i := 1; i < len(timestamps); i++ {
+		diff := diffs[i-1]
+		y := normalizedData[i-1]
+		isZero := diff <= 0
+		color := getColor(diff, avgInterval)
+		colors = append(colors, color)
+
+		data = append(data, Point{
+			X:      timestamps[i],
+			Y:      y,
+			Diff:   diff,
+			Time:   formatTime(timestamps[i]),
+			Height: h1 + i,
+			Zero:   isZero,
+		})
+	}
+
+	totalDuration := timestamps[len(timestamps)-1] - timestamps[0]
+	ratePerHour := float64(len(diffs)) * 3600 / float64(totalDuration)
+
+	// ---------- 常量定义 ----------
+	const zeroY = 110.0
+
+	// ---------- X 轴范围：时间轴 ----------
+	minX := timestamps[0]
+	maxX := timestamps[len(timestamps)-1] + 180
+	timeRange := maxX - minX
+	stepSize := float64(timeRange) / 6
+
+	const htmlTemplate = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>出块速率分析报告 [{{.H1}} → {{.H2}}]</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body{font-family:system-ui,sans-serif;margin:20px;background:#f9f9fb;}
+    .container{max-width:1200px;margin:auto;background:white;padding:20px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.1);}
+    h1{color:#2c3e50;text-align:center;}
+    .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0;}
+    .stat{background:#eef5ff;padding:15px;border-radius:8px;text-align:center;}
+    .stat strong{display:block;font-size:1.5em;color:#3498db;}
+    canvas{border:1px solid #ddd;border-radius:8px;margin:20px 0;}
+    .footer{text-align:center;margin-top:30px;color:#7f8c8d;font-size:0.9em;}
+    .legend{margin:10px 0;font-size:0.9em;color:#e74c3c;}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>出块速率分析报告 [{{.H1}} → {{.H2}}]</h1>
+
+    <div class="stats">
+      <div class="stat"><strong>{{.BlockCount}}</strong> 总区块数</div>
+      <div class="stat"><strong>{{.Duration}}</strong> 总时长</div>
+      <div class="stat"><strong>{{printf "%.2f" .AvgInterval}} 秒</strong> 平均出块时间</div>
+      <div class="stat"><strong>{{printf "%.2f" .RatePerHour}} 块/小时</strong> 出块速率</div>
+    </div>
+
+    <div class="legend">Warning: 红色星号 = 异常出块（0秒或负数） | Y轴：归一化速率（√变换 0-100）</div>
 
     <canvas id="rateChart" width="1200" height="360"></canvas>
 
@@ -386,9 +767,10 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []
     const data = {{.JSONData}};
     const colors = {{.Colors}};
     const zeroY = {{.ZeroY}};
-    const avgY = {{.AvgY}};
+    const avgY = {{.AvgRateNorm}};
     const minSqrt = {{.MinSqrt}};
     const maxSqrt = {{.MaxSqrt}};
+    const avgRate = {{printf "%.2f" .AvgRate}};
 
     new Chart(ctx, {
       type: 'scatter',
@@ -430,7 +812,7 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []
                 const r = ctx.raw;
                 if (ctx.datasetIndex === 0) {
                   return [
-                    '平均出块时间: {{printf "%.2f" .AvgInterval}} 秒',
+                    '平均出块速率: ' + avgRate + ' 块/小时',
                     '归一化 Y: ' + avgY.toFixed(1)
                   ];
                 }
@@ -495,15 +877,16 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []
 		BlockCount  int
 		Duration    string
 		AvgInterval float64
+		AvgRate     float64     // 平均速率（块/小时）
+		AvgRateNorm float64     // 归一化的平均速率
 		RatePerHour float64
 		JSONData    template.JS
 		Colors      template.JS
 		ZeroY       float64
-		AvgY        float64
 		MinSqrt     float64
 		MaxSqrt     float64
-		MinX        int64       // X轴最小值（时间戳）
-		MaxX        int64       // X轴最大值（时间戳）
+		MinX        int64
+		MaxX        int64
 		StepSize    float64
 		Now         string
 	}
@@ -542,11 +925,12 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []
 		BlockCount:  h2 - h1 + 1,
 		Duration:    (time.Duration(totalDuration) * time.Second).String(),
 		AvgInterval: avgInterval,
+		AvgRate:     avgRate,
+		AvgRateNorm: avgRateNorm,
 		RatePerHour: ratePerHour,
 		JSONData:    template.JS(jsonData),
 		Colors:      template.JS(jsonColors),
 		ZeroY:       zeroY,
-		AvgY:        avgY,
 		MinSqrt:     minSqrt,
 		MaxSqrt:     maxSqrt,
 		MinX:        minX,
