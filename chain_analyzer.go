@@ -54,6 +54,7 @@ func initLog() error {
 func logf(format string, args ...interface{}) {
 	if logFile != nil {
 		fmt.Fprintf(logFile, format+"\n", args...)
+		logFile.Sync() // 立即刷新到磁盘，避免缓冲问题
 	}
 }
 
@@ -123,6 +124,7 @@ func main() {
 	fmt.Printf("正在分析区块 %d → %d...\n", cfg.H1, cfg.H2)
 
 	timestamps, err := getBlockTimestamps(cfg)
+	fmt.Println() // 进度显示后换行
 	if err != nil {
 		fmt.Printf("错误: %v\n", err)
 		return
@@ -130,8 +132,18 @@ func main() {
 
 	// === 1. 计算所有间隔（包含 0）===
 	diffs := make([]int64, len(timestamps)-1)
+	negativeCount := 0
+	negativeTotalTime := int64(0)
 	for i := 1; i < len(timestamps); i++ {
-		diffs[i-1] = timestamps[i] - timestamps[i-1]
+		diff := timestamps[i] - timestamps[i-1]
+		diffs[i-1] = diff
+		if diff < 0 {
+			negativeCount++
+			negativeTotalTime += -diff // 累计倒退的时间（取绝对值）
+			logf("警告: 高度 %d → %d 时间倒退 %d 秒 (从 %s 到 %s)",
+				cfg.H1+i-1, cfg.H1+i, -diff,
+				formatTime(timestamps[i-1]), formatTime(timestamps[i]))
+		}
 	}
 
 	// === 2. 基础统计（包含 0 间隔）===
@@ -152,6 +164,7 @@ func main() {
 		maxDiff = max(positiveDiffs)
 	}
 	mode := findMode(diffs)
+	positiveMode := findMode(positiveDiffs)
 
 	// === 3. 终端速率曲线图（归一化+偏移）===
 	drawRateChart(diffs, timestamps, cfg.H1, cfg.H2)
@@ -160,7 +173,7 @@ func main() {
 	report := smartRateAnalysis(diffs, avgInterval, timestamps, cfg.H1)
 
 	// === 5. 输出报告 ===
-	printSmartReport(cfg.H1, cfg.H2, totalDuration, avgInterval, ratePerHour, maxDiff, mode, report)
+	printSmartReport(cfg.H1, cfg.H2, totalDuration, avgInterval, ratePerHour, maxDiff, mode, positiveMode, negativeCount, negativeTotalTime, report)
 
 	// === 6. 生成 HTML 报告（归一化+只点）===
 	htmlPath := generateHTMLReport(cfg.H1, cfg.H2, timestamps, diffs, avgInterval)
@@ -591,7 +604,7 @@ func getBlockTimestamps(cfg Config) ([]int64, error) {
 		)
 		
 		if (height-cfg.H1)%100 == 0 {
-			fmt.Printf("已处理 %d 个区块...\n", height-cfg.H1+1)
+			fmt.Printf("\r已处理 %d 个区块...", height-cfg.H1+1)
 		}
 	}
 	return timestamps, nil
@@ -738,7 +751,7 @@ func findLongestRateStreak(rates []float64, timestamps []int64, condition func(f
 	return bestStart, bestEnd, maxLen
 }
 
-func printSmartReport(h1, h2 int, total int64, avgInterval, ratePerHour float64, maxDiff, mode int64, smart string) {
+func printSmartReport(h1, h2 int, total int64, avgInterval, ratePerHour float64, maxDiff, mode, positiveMode int64, negativeCount int, negativeTotalTime int64, smart string) {
 	fmt.Printf("出块时间分析报告 [%d → %d]\n", h1, h2)
 	fmt.Printf("总区块数: %d\n", h2-h1+1)
 	fmt.Printf("总时长: %s\n", time.Duration(total)*time.Second)
@@ -746,5 +759,10 @@ func printSmartReport(h1, h2 int, total int64, avgInterval, ratePerHour float64,
 	fmt.Printf("出块速率: %.2f 块/小时\n", ratePerHour)
 	fmt.Printf("最长出块: %s\n", time.Duration(maxDiff)*time.Second)
 	fmt.Printf("最常见间隔: %s\n", time.Duration(mode)*time.Second)
+	fmt.Printf("正数间隔的众数: %s\n", time.Duration(positiveMode)*time.Second)
+	if negativeCount > 0 {
+		fmt.Printf("时间倒退的区块: %d 个\n", negativeCount)
+		fmt.Printf("时间倒退的总时长: %s\n", time.Duration(negativeTotalTime)*time.Second)
+	}
 	fmt.Printf("\n智能速率分析:\n%s\n", smart)
 }
