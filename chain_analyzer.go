@@ -163,20 +163,23 @@ func main() {
 	if len(positiveDiffs) > 0 {
 		maxDiff = max(positiveDiffs)
 	}
-	mode := findMode(diffs)
-	positiveMode := findMode(positiveDiffs)
+	modes := findModes(diffs)
+	positiveModes := findModes(positiveDiffs)
 
-	// === 3. 终端速率曲线图（归一化+偏移）===
-	drawRateChart(diffs, timestamps, cfg.H1, cfg.H2)
+	// === 3. 统一平方根归一化（只计算一次）===
+	normalizedData, minSqrt, maxSqrt := normalizeSqrtRate(diffs)
 
-	// === 4. 智能速率区间分析 ===
+	// === 4. 终端速率曲线图 ===
+	drawRateChart(normalizedData, timestamps, cfg.H1, cfg.H2)
+
+	// === 5. 智能速率区间分析 ===
 	report := smartRateAnalysis(diffs, avgInterval, timestamps, cfg.H1)
 
-	// === 5. 输出报告 ===
-	printSmartReport(cfg.H1, cfg.H2, totalDuration, avgInterval, ratePerHour, maxDiff, mode, positiveMode, negativeCount, negativeTotalTime, report)
+	// === 6. 输出报告 ===
+	printSmartReport(cfg.H1, cfg.H2, totalDuration, avgInterval, ratePerHour, maxDiff, modes, positiveModes, negativeCount, negativeTotalTime, report)
 
-	// === 6. 生成 HTML 报告（归一化+只点）===
-	htmlPath := generateHTMLReport(cfg.H1, cfg.H2, timestamps, diffs, avgInterval)
+	// === 7. 生成 HTML 报告 ===
+	htmlPath := generateHTMLReport(cfg.H1, cfg.H2, timestamps, diffs, normalizedData, avgInterval, minSqrt, maxSqrt)
 	fmt.Printf("HTML 报告已生成：%s\n", htmlPath)
 
 	if browser {
@@ -184,8 +187,48 @@ func main() {
 	}
 }
 
+// ====================== 统一归一化函数 ======================
+// normalizeSqrtRate 使用平方根变换进行归一化
+// 关键：d <= 0 的数据用 110.0 占位，不参与 min/max 计算，但保持索引对应
+func normalizeSqrtRate(diffs []int64) (normalized []float64, minSqrt, maxSqrt float64) {
+	// 1. 只收集正常数据的 sqrt(rate) 用于计算 min/max
+	var sqrtRates []float64
+	for _, d := range diffs {
+		if d > 0 {
+			r := 3600.0 / float64(d)
+			sqrtRates = append(sqrtRates, math.Sqrt(r))
+		}
+	}
+	
+	// 2. 计算正常数据的范围
+	sort.Float64s(sqrtRates)
+	minSqrt, maxSqrt = 0.0, 1.0
+	if len(sqrtRates) > 0 {
+		minSqrt = sqrtRates[0]
+		maxSqrt = sqrtRates[len(sqrtRates)-1]
+	}
+	rangeSqrt := maxSqrt - minSqrt
+	if rangeSqrt == 0 {
+		rangeSqrt = 1
+	}
+	
+	// 3. 归一化所有数据（包括异常值）
+	normalized = make([]float64, len(diffs))
+	for i, d := range diffs {
+		if d <= 0 {
+			normalized[i] = 110.0 // 异常值占位：100 + 10
+		} else {
+			r := 3600.0 / float64(d)
+			sqrtR := math.Sqrt(r)
+			normalized[i] = (sqrtR - minSqrt) / rangeSqrt * 100.0
+		}
+	}
+	
+	return normalized, minSqrt, maxSqrt
+}
+
 // ====================== 终端图 ======================
-func drawRateChart(diffs []int64, timestamps []int64, h1, h2 int) {
+func drawRateChart(normalizedData []float64, timestamps []int64, h1, h2 int) {
 	const width = 80
 	const height = 15
 	chart := make([][]rune, height)
@@ -196,45 +239,9 @@ func drawRateChart(diffs []int64, timestamps []int64, h1, h2 int) {
 		}
 	}
 
-	// ---------- 归一化 ----------
-	var rates []float64
-	for _, d := range diffs {
-		if d <= 0 {
-			rates = append(rates, 1e9) // 0 秒先占位
-		} else {
-			rates = append(rates, 3600.0/float64(d))
-		}
-	}
-	// 只对非 0 秒做 min-max
-	var pos []float64
-	for _, r := range rates {
-		if r < 1e9 {
-			pos = append(pos, r)
-		}
-	}
-	sort.Float64s(pos)
-	minR, maxR := 0.0, 1000.0
-	if len(pos) > 0 {
-		minR = pos[0]
-		maxR = pos[len(pos)-1]
-	}
-	rangeR := maxR - minR
-	if rangeR == 0 {
-		rangeR = 1
-	}
-	// 归一化后 0 秒显示值
-	zeroY := 110.0 // 100 + 10
-
-	// ---------- 绘制 ----------
-	for i, d := range diffs {
-		x := i * (width - 1) / len(diffs)
-		var yNorm float64
-		if d <= 0 {
-			yNorm = zeroY
-		} else {
-			r := 3600.0 / float64(d)
-			yNorm = (r - minR) / rangeR * 100.0
-		}
+	// ---------- 绘制（使用已归一化的数据）----------
+	for i, yNorm := range normalizedData {
+		x := i * (width - 1) / len(normalizedData)
 		y := int((100.0 - yNorm) / 100.0 * float64(height-2))
 		if y < 0 {
 			y = 0
@@ -242,8 +249,9 @@ func drawRateChart(diffs []int64, timestamps []int64, h1, h2 int) {
 		if y >= height-1 {
 			y = height - 2
 		}
+		// 异常值用星号标记
 		char := '█'
-		if d <= 0 {
+		if yNorm >= 110.0 {
 			char = '*'
 		}
 		chart[y][x] = char
@@ -264,8 +272,8 @@ func drawRateChart(diffs []int64, timestamps []int64, h1, h2 int) {
 		copy(chart[height-1][start:], []rune(label))
 	}
 
-	fmt.Printf("\n出块速率曲线图 (归一化 0-100，0秒偏移至 110)\n")
-	fmt.Printf("※ '*' = 0 秒出块（高出 10）\n")
+	fmt.Printf("\n出块速率曲线图 (√归一化 0-100，异常值偏移至 110)\n")
+	fmt.Printf("※ '*' = 异常出块（0秒或负数，高出 10）\n")
 	for _, row := range chart {
 		fmt.Printf("%s\n", string(row))
 	}
@@ -273,49 +281,24 @@ func drawRateChart(diffs []int64, timestamps []int64, h1, h2 int) {
 }
 
 // ====================== HTML 报告 ======================
-func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, avgInterval float64) string {
+func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []float64, avgInterval, minSqrt, maxSqrt float64) string {
 	var data []Point
 	var colors []string
 
-	// ---------- 1. 计算非 0 秒的速率并取平方根 ----------
-	var posRates []float64
-	var sqrtRates []float64
-	for _, d := range diffs {
-		if d > 0 {
-			r := 3600.0 / float64(d)
-			posRates = append(posRates, r)
-			sqrtRates = append(sqrtRates, math.Sqrt(r))
-		}
-	}
-	sort.Float64s(sqrtRates)
-	minSqrt, maxSqrt := 0.0, 1.0
-	if len(sqrtRates) > 0 {
-		minSqrt = sqrtRates[0]
-		maxSqrt = sqrtRates[len(sqrtRates)-1]
-	}
+	// ---------- 计算平均速率的归一化 Y ----------
+	avgRate := 3600.0 / avgInterval
+	avgSqrt := math.Sqrt(avgRate)
 	rangeSqrt := maxSqrt - minSqrt
 	if rangeSqrt == 0 {
 		rangeSqrt = 1
 	}
-
-	// ---------- 计算平均速率的 sqrt 归一化 Y ----------
-	avgRate := 3600.0 / avgInterval
-	avgSqrt := math.Sqrt(avgRate)
 	avgY := (avgSqrt - minSqrt) / rangeSqrt * 100.0
 
-	// ---------- 2. 构造点（使用 sqrt 归一化）----------
-	zeroY := 110.0 // 0 秒偏移
+	// ---------- 构造点（使用已归一化的数据）----------
 	for i := 1; i < len(timestamps); i++ {
 		diff := diffs[i-1]
+		y := normalizedData[i-1]
 		isZero := diff <= 0
-		var y float64
-		if isZero {
-			y = zeroY
-		} else {
-			r := 3600.0 / float64(diff)
-			sqrtR := math.Sqrt(r)
-			y = (sqrtR - minSqrt) / rangeSqrt * 100.0
-		}
 		color := getColor(diff, avgInterval)
 		colors = append(colors, color)
 
@@ -330,6 +313,9 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, avgInterval float
 
 	totalDuration := timestamps[len(timestamps)-1] - timestamps[0]
 	ratePerHour := float64(len(diffs)) * 3600 / float64(totalDuration)
+
+	// ---------- 常量定义 ----------
+	const zeroY = 110.0 // 异常值显示位置
 
 	// ---------- X 轴中位点 ----------
 	minX := h1 + 1
@@ -366,7 +352,7 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, avgInterval float
       <div class="stat"><strong>{{printf "%.2f" .RatePerHour}} 块/小时</strong> 出块速率</div>
     </div>
 
-    <div class="legend">Warning: 红色星号 = 0 秒出块（归一化后 100 + 10）</div>
+    <div class="legend">Warning: 红色星号 = 异常出块（0秒或负数，归一化后 100 + 10）</div>
 
     <canvas id="rateChart" width="1200" height="360"></canvas>
 
@@ -425,9 +411,9 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, avgInterval float
                 }
                 if (r.zero) {
                   return [
-                    'Warning: 0 秒出块！',
+                    'Warning: 异常出块！',
                     '显示值: ' + zeroY.toFixed(1),
-                    '实际间隔: 0 秒',
+                    '实际间隔: ' + r.diff + ' 秒',
                     '时间: ' + r.time
                   ];
                 } else {
@@ -443,7 +429,7 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, avgInterval float
               }
             }
           },
-          title: {display:true, text:'出块速率（√归一化 0-100，0 秒偏移）', font:{size:13}}
+          title: {display:true, text:'出块速率（√归一化 0-100，异常值偏移至 110）', font:{size:13}}
         },
         scales: {
           x: {
@@ -659,20 +645,56 @@ func max(data []int64) int64 {
 	return m
 }
 
-func findMode(data []int64) int64 {
+// findModes 返回所有频次最高的值（可能有多个）
+func findModes(data []int64) []int64 {
+	if len(data) == 0 {
+		return []int64{}
+	}
+	
 	count := make(map[int64]int)
 	for _, v := range data {
 		count[v]++
 	}
+	
+	// 找出最大频次
 	maxCount := 0
-	mode := int64(0)
-	for v, c := range count {
+	for _, c := range count {
 		if c > maxCount {
 			maxCount = c
-			mode = v
 		}
 	}
-	return mode
+	
+	// 收集所有频次等于 maxCount 的值
+	var modes []int64
+	for v, c := range count {
+		if c == maxCount {
+			modes = append(modes, v)
+		}
+	}
+	
+	// 排序，确保结果确定
+	sort.Slice(modes, func(i, j int) bool {
+		return modes[i] < modes[j]
+	})
+	
+	return modes
+}
+
+// formatModes 格式化众数列表为字符串
+func formatModes(modes []int64) string {
+	if len(modes) == 0 {
+		return "无"
+	}
+	
+	var parts []string
+	for _, m := range modes {
+		parts = append(parts, (time.Duration(m) * time.Second).String())
+	}
+	
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	return strings.Join(parts, ", ") + fmt.Sprintf(" (共%d个)", len(parts))
 }
 
 func formatTime(ts int64) string {
@@ -751,15 +773,15 @@ func findLongestRateStreak(rates []float64, timestamps []int64, condition func(f
 	return bestStart, bestEnd, maxLen
 }
 
-func printSmartReport(h1, h2 int, total int64, avgInterval, ratePerHour float64, maxDiff, mode, positiveMode int64, negativeCount int, negativeTotalTime int64, smart string) {
+func printSmartReport(h1, h2 int, total int64, avgInterval, ratePerHour float64, maxDiff int64, modes, positiveModes []int64, negativeCount int, negativeTotalTime int64, smart string) {
 	fmt.Printf("出块时间分析报告 [%d → %d]\n", h1, h2)
 	fmt.Printf("总区块数: %d\n", h2-h1+1)
 	fmt.Printf("总时长: %s\n", time.Duration(total)*time.Second)
 	fmt.Printf("平均出块时间: %.2f 秒\n", avgInterval)
 	fmt.Printf("出块速率: %.2f 块/小时\n", ratePerHour)
 	fmt.Printf("最长出块: %s\n", time.Duration(maxDiff)*time.Second)
-	fmt.Printf("最常见间隔: %s\n", time.Duration(mode)*time.Second)
-	fmt.Printf("正数间隔的众数: %s\n", time.Duration(positiveMode)*time.Second)
+	fmt.Printf("最常见间隔: %s\n", formatModes(modes))
+	fmt.Printf("正数间隔的众数: %s\n", formatModes(positiveModes))
 	if negativeCount > 0 {
 		fmt.Printf("时间倒退的区块: %d 个\n", negativeCount)
 		fmt.Printf("时间倒退的总时长: %s\n", time.Duration(negativeTotalTime)*time.Second)
