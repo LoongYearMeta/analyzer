@@ -85,11 +85,12 @@ type BlockHeader struct {
 }
 
 type Point struct {
-	X    int     `json:"x"`
-	Y    float64 `json:"y"`
-	Diff int64   `json:"diff"`
-	Time string  `json:"time"`
-	Zero bool    `json:"zero"`
+	X       int64   `json:"x"`       // Unix时间戳
+	Y       float64 `json:"y"`       // 归一化的速率
+	Diff    int64   `json:"diff"`    // 时间间隔（秒）
+	Time    string  `json:"time"`    // 格式化的时间
+	Height  int     `json:"height"`  // 区块高度
+	Zero    bool    `json:"zero"`    // 是否异常值
 }
 
 func main() {
@@ -239,9 +240,23 @@ func drawRateChart(normalizedData []float64, timestamps []int64, h1, h2 int) {
 		}
 	}
 
-	// ---------- 绘制（使用已归一化的数据）----------
+	// ---------- 计算时间范围（x轴：时间轴）----------
+	minTime := timestamps[0]
+	maxTime := timestamps[len(timestamps)-1] + 180 // 最后一个块 + 3分钟
+	timeRange := maxTime - minTime
+	
+	// ---------- 绘制（使用时间轴映射）----------
 	for i, yNorm := range normalizedData {
-		x := i * (width - 1) / len(normalizedData)
+		// 计算每个点在时间轴上的位置
+		pointTime := timestamps[i+1] // normalizedData[i] 对应第 i+1 个块
+		x := int(float64(pointTime-minTime) / float64(timeRange) * float64(width-1))
+		if x < 0 {
+			x = 0
+		}
+		if x >= width {
+			x = width - 1
+		}
+		
 		y := int((100.0 - yNorm) / 100.0 * float64(height-2))
 		if y < 0 {
 			y = 0
@@ -249,6 +264,7 @@ func drawRateChart(normalizedData []float64, timestamps []int64, h1, h2 int) {
 		if y >= height-1 {
 			y = height - 2
 		}
+		
 		// 异常值用星号标记
 		char := '█'
 		if yNorm >= 110.0 {
@@ -257,11 +273,15 @@ func drawRateChart(normalizedData []float64, timestamps []int64, h1, h2 int) {
 		chart[y][x] = char
 	}
 
-	// ---------- X 轴四个中位点 ----------
+	// ---------- X 轴刻度：显示时间 ----------
 	positions := []int{0, width / 4, width / 2, 3 * width / 4, width - 1}
 	for _, x := range positions {
-		heightVal := h1 + (h2-h1)*x/(width-1)
-		label := fmt.Sprintf("%d", heightVal)
+		// 计算该位置对应的时间戳
+		timestamp := minTime + int64(float64(timeRange)*float64(x)/float64(width-1))
+		// 格式化为简短时间（月-日 时:分）
+		t := time.Unix(timestamp, 0)
+		label := t.Format("01-02 15:04")
+		
 		start := x - len(label)/2
 		if start < 0 {
 			start = 0
@@ -273,7 +293,7 @@ func drawRateChart(normalizedData []float64, timestamps []int64, h1, h2 int) {
 	}
 
 	fmt.Printf("\n出块速率曲线图 (√归一化 0-100，异常值偏移至 110)\n")
-	fmt.Printf("※ '*' = 异常出块（0秒或负数，高出 10）\n")
+	fmt.Printf("※ '*' = 异常出块（0秒或负数，高出 10） | X轴：时间轴\n")
 	for _, row := range chart {
 		fmt.Printf("%s\n", string(row))
 	}
@@ -294,7 +314,7 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []
 	}
 	avgY := (avgSqrt - minSqrt) / rangeSqrt * 100.0
 
-	// ---------- 构造点（使用已归一化的数据）----------
+	// ---------- 构造点（使用时间轴）----------
 	for i := 1; i < len(timestamps); i++ {
 		diff := diffs[i-1]
 		y := normalizedData[i-1]
@@ -303,11 +323,12 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []
 		colors = append(colors, color)
 
 		data = append(data, Point{
-			X:    h1 + i,
-			Y:    y,
-			Diff: diff,
-			Time: formatTime(timestamps[i]),
-			Zero: isZero,
+			X:      timestamps[i],           // X轴：时间戳
+			Y:      y,
+			Diff:   diff,
+			Time:   formatTime(timestamps[i]),
+			Height: h1 + i,                  // 保留区块高度用于tooltip
+			Zero:   isZero,
 		})
 	}
 
@@ -317,10 +338,11 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []
 	// ---------- 常量定义 ----------
 	const zeroY = 110.0 // 异常值显示位置
 
-	// ---------- X 轴中位点 ----------
-	minX := h1 + 1
-	maxX := h2
-	stepSize := float64(maxX-minX) / 4
+	// ---------- X 轴范围：时间轴 ----------
+	minX := timestamps[0]
+	maxX := timestamps[len(timestamps)-1] + 180 // 最后一个块 + 3分钟
+	timeRange := maxX - minX
+	stepSize := float64(timeRange) / 6 // 分成6段，显示更多刻度
 
 	const htmlTemplate = `
 <!DOCTYPE html>
@@ -400,7 +422,10 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []
         plugins: {
           tooltip: {
             callbacks: {
-              title: ctx => '高度: ' + ctx[0].parsed.x,
+              title: ctx => {
+                const r = ctx[0].raw;
+                return '高度: ' + r.height + ' | 时间: ' + r.time;
+              },
               label: ctx => {
                 const r = ctx.raw;
                 if (ctx.datasetIndex === 0) {
@@ -413,8 +438,7 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []
                   return [
                     'Warning: 异常出块！',
                     '显示值: ' + zeroY.toFixed(1),
-                    '实际间隔: ' + r.diff + ' 秒',
-                    '时间: ' + r.time
+                    '实际间隔: ' + r.diff + ' 秒'
                   ];
                 } else {
                   const sqrtY = r.y / 100 * (maxSqrt - minSqrt) + minSqrt;
@@ -422,24 +446,28 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []
                   return [
                     '归一化(√): ' + r.y.toFixed(1),
                     '实际速率: ' + realRate.toFixed(2) + ' 块/小时',
-                    '间隔: ' + r.diff + ' 秒',
-                    '时间: ' + r.time
+                    '间隔: ' + r.diff + ' 秒'
                   ];
                 }
               }
             }
           },
-          title: {display:true, text:'出块速率（√归一化 0-100，异常值偏移至 110）', font:{size:13}}
+          title: {display:true, text:'出块速率（√归一化 0-100，异常值偏移至 110） | X轴：时间轴', font:{size:13}}
         },
         scales: {
           x: {
             type: 'linear',
             min: {{.MinX}},
             max: {{.MaxX}},
-            title: {display:true, text:'区块高度'},
+            title: {display:true, text:'时间'},
             ticks: {
               stepSize: {{.StepSize}},
-              callback: v => Math.round(v),
+              callback: v => {
+                const d = new Date(v * 1000);
+                return d.getMonth()+1 + '-' + d.getDate() + ' ' + 
+                       String(d.getHours()).padStart(2,'0') + ':' + 
+                       String(d.getMinutes()).padStart(2,'0');
+              },
               font: {size: 10}
             },
             grid: {lineWidth: 0.5}
@@ -472,10 +500,10 @@ func generateHTMLReport(h1, h2 int, timestamps, diffs []int64, normalizedData []
 		Colors      template.JS
 		ZeroY       float64
 		AvgY        float64
-		MinSqrt     float64 // 新增
-		MaxSqrt     float64 // 新增
-		MinX        int
-		MaxX        int
+		MinSqrt     float64
+		MaxSqrt     float64
+		MinX        int64       // X轴最小值（时间戳）
+		MaxX        int64       // X轴最大值（时间戳）
 		StepSize    float64
 		Now         string
 	}
