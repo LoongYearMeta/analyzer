@@ -25,7 +25,8 @@ const ANALYZER_INFO = {
         { name: 'html', type: 'boolean', default: false },
         { name: 'chart', type: 'boolean', default: false },
         { name: 'verbose', alias: 'v', type: 'boolean', default: false },
-        { name: 'concurrency', alias: 'c', type: 'number', default: 1 } // 已无效，仅保留参数
+        { name: 'concurrency', alias: 'c', type: 'number', default: 1 }, // 已无效，仅保留参数
+        { name: 'top', alias: 'n', type: 'number', default: 10 }
     ]
 };
 
@@ -93,7 +94,7 @@ async function analyzeBlock(blockHeight, rpc, reporter) {
 
 // ============ 主分析逻辑（改：串行流式） ============
 async function analyzeAncestorDepth(config = {}) {
-    const rpc = new RPCClient(config.rpc);
+    const rpc = new RPCClient({ ...config.rpc, cache: false });
     const reporter = new Reporter({ silent: config.silent });
 
     const latestHeight = await rpc.getBlockCount();
@@ -105,11 +106,11 @@ async function analyzeAncestorDepth(config = {}) {
     reporter.kv('区块数量', endHeight - startHeight + 1);
     reporter.log('');
 
-    let globalMax = 0;
-    let globalMaxHeight = null;
+    const topN = config.top || 10;
     let globalSum = 0;
     let globalCount = 0;
     const globalHistogram = {};
+    const topBlocks = []; // { height, max }
 
     // ✅ 串行处理（关键修复）
     for (let h = startHeight; h <= endHeight; h++) {
@@ -118,10 +119,7 @@ async function analyzeAncestorDepth(config = {}) {
 
         if (!res) continue;
 
-        if (res.max > globalMax) {
-            globalMax = res.max;
-            globalMaxHeight = h;
-        }
+        topBlocks.push({ height: h, max: res.max });
         globalSum += res.sum;
         globalCount += res.count;
 
@@ -130,13 +128,19 @@ async function analyzeAncestorDepth(config = {}) {
         }
     }
 
+    topBlocks.sort((a, b) => b.max - a.max);
+
     const avgDepth = globalCount > 0 ? globalSum / globalCount : 0;
+
+    const globalMax = topBlocks.length > 0 ? topBlocks[0].max : 0;
+    const globalMaxHeight = topBlocks.length > 0 ? topBlocks[0].height : null;
 
     // ===== 输出 =====
     reporter.section('整体统计');
-    reporter.log('【最大深度统计】');
-    reporter.kv('全局最大值', globalMax, '(区块 #' + globalMaxHeight + ')');
-    reporter.kv('区块 #' , globalMaxHeight);
+    reporter.log(`【最大深度 Top ${topN}】`);
+    topBlocks.slice(0, topN).forEach((b, i) => {
+        reporter.kv(`  #${String(i + 1).padStart(2, '0')} 区块 ${b.height}`, b.max);
+    });
 
     reporter.log('\n【平均深度统计】');
     reporter.kv('平均值', avgDepth.toFixed(2));
@@ -173,6 +177,8 @@ async function analyzeAncestorDepth(config = {}) {
         config: { startHeight, endHeight },
         data: {
             maxDepth: globalMax,
+            maxDepthHeight: globalMaxHeight,
+            topBlocks: topBlocks.slice(0, topN),
             avgDepth,
             depthDistribution: distData,
             totalTransactions: globalCount
@@ -234,6 +240,10 @@ function parseArgs() {
             case '--concurrency':
             case '-c':
                 config.concurrency = parseInt(args[++i]);
+                break;
+            case '--top':
+            case '-n':
+                config.top = parseInt(args[++i]);
                 break;
             case '--help':
             case '-h':
