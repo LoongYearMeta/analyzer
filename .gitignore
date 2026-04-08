@@ -1,0 +1,13 @@
+# 生成的报告
+reports/
+
+# 依赖
+node_modules/
+package.json
+package-lock.json
+
+# Python 虚拟环境
+.venv/
+
+# 本地配置
+.env
