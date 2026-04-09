@@ -271,6 +271,11 @@ class AnalyzerFramework {
                     }
                     break;
 
+                case 'tx-forest':
+                    // tx-forest 自己生成完整 HTML，框架层跳过 Chart.js 绘图
+                    // htmlPath 由分析器自身在 config.html=true 时生成
+                    break;
+
                 case 'ancestor-depth':
                     // 最大深度趋势
                     if (chartData.maxDepths) {
@@ -374,6 +379,17 @@ function parseGlobalArgs() {
             case '-e':
                 config.end = parseInt(args[++i]);
                 break;
+            case '--block':
+            case '-b':
+                config.block = parseInt(args[++i]);
+                break;
+            case '--top':
+            case '-t':
+                config.top = parseInt(args[++i]);
+                break;
+            case '--limit':
+                config.limit = parseInt(args[++i]);
+                break;
             case '--html':
                 config.html = true;
                 break;
@@ -415,12 +431,16 @@ function printUsage() {
   tx-count              区块交易数量分析
   ancestor-depth        交易祖先深度分析
   block-interval        出块间隔分析
+  tx-forest             区块交易森林分析（依赖关系DAG可视化）
   all                   运行所有分析器
   tx-count,block-interval  组合运行多个分析器（用逗号分隔）
 
 全局选项:
   -s, --start <高度>     起始区块高度
   -e, --end <高度>       结束区块高度
+  -b, --block <高度>     目标区块高度（tx-forest 专用）
+  -t, --top <N>          可视化前 N 棵最大树（tx-forest 专用，默认: 5）
+      --limit <N>        每棵树最多展示节点数（tx-forest 专用，默认: 300）
       --html             生成统一 HTML 报告（框架统一绘图）
   -o, --output-dir <目录> 报告输出目录 (默认: ./reports)
   -l, --list             列出所有可用分析器
