@@ -11,3 +11,4 @@ package-lock.json
 
 # 本地配置
 .env
+.worktrees/
