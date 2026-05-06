@@ -28,7 +28,8 @@ const ANALYZER_INFO = {
         { name: 'start', alias: 's', type: 'number', description: '起始区块高度', default: null },
         { name: 'end', alias: 'e', type: 'number', description: '结束区块高度', default: null },
         { name: 'html', type: 'boolean', description: '生成 HTML 报告', default: false },
-        { name: 'chart', type: 'boolean', description: '显示 ASCII 图表', default: false }
+        { name: 'chart', type: 'boolean', description: '显示 ASCII 图表', default: false },
+        { name: 'linear', type: 'boolean', description: '使用线性归一化（默认开平方）', default: false }
     ]
 };
 
@@ -153,7 +154,7 @@ async function analyzeBlockInterval(config = {}) {
     const secondsPerBlock = totalDuration / blocks.length;
 
     // 归一化（与 chain_analyzer.go 一致）
-    const useSqrt = false; // 可配置
+    const useSqrt = config.linear !== true;
     const normalized = normalizeIntervals(intervalValues, useSqrt);
 
     // 输出统计
@@ -201,9 +202,11 @@ async function analyzeBlockInterval(config = {}) {
     }));
 
     // 平均线的归一化值
-    const avgIntervalNorm = normalized.useSqrt
-        ? (Math.sqrt(secondsPerBlock) - normalized.minT) / (normalized.maxT - normalized.minT) * 100
-        : (secondsPerBlock / normalized.maxInterval) * 100;
+    const rangeT = normalized.maxT - normalized.minT || 1;
+    const avgIntervalTransformed = normalized.useSqrt
+        ? Math.sqrt(secondsPerBlock)
+        : secondsPerBlock;
+    const avgIntervalNorm = (avgIntervalTransformed - normalized.minT) / rangeT * 100;
 
     // ============ ASCII 图表（与 chain_analyzer.go 等效）============
     if (config.chart) {
@@ -350,6 +353,9 @@ function parseArgs() {
             case '--chart':
                 config.chart = true;
                 break;
+            case '--linear':
+                config.linear = true;
+                break;
             case '--silent':
                 config.silent = true;
                 break;
@@ -376,6 +382,7 @@ function printUsage() {
     console.log('示例:');
     console.log(`  node ${__filename} --start 824190 --end 824200 --html --chart`);
     console.log(`  node ${__filename} --html`);
+    console.log(`  node ${__filename} --start 824190 --end 824200 --linear --chart`);
 }
 
 // ============ 导出和独立运行 ============
