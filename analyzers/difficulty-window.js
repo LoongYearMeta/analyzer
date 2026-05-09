@@ -171,7 +171,12 @@ async function analyzeDifficultyWindow(config = {}) {
 
     for (let H = startHeight; H <= endHeight; H++) {
         const prevBlock = blockCache.get(H - 1);
-        if (!prevBlock) { rows.push({ height: H, reason: 'MISSING_DATA' }); continue; }
+        if (!prevBlock) {
+            rows.push({ height: H, reason: 'MISSING_DATA', actualBits: null, computedBits: null,
+                        rawBits: null, upBits: null, dnBits: null, prevBits: null, match: null,
+                        windowAvgInterval: 0, newBlockSpacing: 600, mtp12: 0 });
+            continue;
+        }
 
         // fork 硬编码点
         if (H - 1 === 824188) {
@@ -187,12 +192,20 @@ async function analyzeDifficultyWindow(config = {}) {
 
         // TBC DAA 检查（mainnet daaHeight=504031 早已激活，仅检查 TBC 分支）
         if (hPrev < P.TBC_FIRST - 1) {
-            rows.push({ height: H, reason: 'PRE_TBC' }); continue;
+            rows.push({ height: H, reason: 'PRE_TBC', actualBits: null, computedBits: null,
+                        rawBits: null, upBits: null, dnBits: null, prevBits: null, match: null,
+                        windowAvgInterval: 0, newBlockSpacing: 600, mtp12: 0 });
+            continue;
         }
 
         // GetSuitableBlock(pindexPrev) → pindexLast
         const [lB1, lB2, lB3] = [blockCache.get(hPrev), blockCache.get(hPrev-1), blockCache.get(hPrev-2)];
-        if (!lB1 || !lB2 || !lB3) { rows.push({ height: H, reason: 'MISSING_DATA' }); continue; }
+        if (!lB1 || !lB2 || !lB3) {
+            rows.push({ height: H, reason: 'MISSING_DATA', actualBits: null, computedBits: null,
+                        rawBits: null, upBits: null, dnBits: null, prevBits: null, match: null,
+                        windowAvgInterval: 0, newBlockSpacing: 600, mtp12: 0 });
+            continue;
+        }
         const pindexLast = getSuitableBlock(lB1, lB2, lB3);
 
         // GetSuitableBlock(GetAncestor(hPrev-144)) → pindexFirst
@@ -283,7 +296,7 @@ async function analyzeDifficultyWindow(config = {}) {
 
     const reasonCount  = {};
     let   mismatchCnt  = 0;
-    const validRows    = rows.filter(r => r.computedBits !== undefined);
+    const validRows    = rows; // 保留所有行，包括 MISSING_DATA / PRE_TBC
 
     for (const r of validRows) {
         const label = REASONS[r.reason] || r.reason;
@@ -300,8 +313,8 @@ async function analyzeDifficultyWindow(config = {}) {
             fmt(r.dnBits).padEnd(COL[3]),
             fmt(r.upBits).padEnd(COL[4]),
             `${r.windowAvgInterval ? r.windowAvgInterval.toFixed(0)+'s' : '-'}`.padEnd(COL[5]),
-            `${r.newBlockSpacing}s`.padEnd(COL[6]),
-            `${(r.mtp12/3600).toFixed(1)}h`.padEnd(COL[7]),
+            `${r.newBlockSpacing !== undefined ? r.newBlockSpacing+'s' : '-'}`.padEnd(COL[6]),
+            `${r.mtp12 !== undefined ? (r.mtp12/3600).toFixed(1)+'h' : '-'}`.padEnd(COL[7]),
             label.padEnd(COL[8]),
             matchStr,
         ].join(' │ '));
@@ -389,6 +402,8 @@ function buildHTML(rows, startH, endH, outputDir) {
         'MTP12_EMERGENCY': '#e67e22',
         'DAA_NORMAL':      '#3498db',
         'HARDCODED_FORK':  '#9b59b6',
+        'MISSING_DATA':    '#95a5a6',
+        'PRE_TBC':         '#bdc3c7',
     };
     const pointColors = rows.map(r => reasonColorMap[r.reason] || '#95a5a6');
     const matchFlags  = rows.map(r => r.match);
@@ -428,6 +443,9 @@ tr:hover td{background:#fafafa}
 .reason-MTP12_EMERGENCY{color:#e67e22;font-weight:700}
 .reason-DAA_NORMAL{color:#3498db}
 .reason-HARDCODED_FORK{color:#9b59b6}
+.reason-MISSING_DATA{color:#95a5a6;font-style:italic}
+.reason-PRE_TBC{color:#bdc3c7}
+tr.missing td{opacity:.5;background:#f5f5f5}
 </style>
 </head>
 <body>
@@ -595,7 +613,7 @@ function buildStatCards(rows, colorMap) {
     const labels = {
         RATE_LIMIT_UP:'↑限速(慢块)', RATE_LIMIT_DN:'↓限速(快块)',
         MTP12_EMERGENCY:'MTP12紧急', DAA_NORMAL:'正常DAA',
-        HARDCODED_FORK:'Fork锚点',
+        HARDCODED_FORK:'Fork锚点', MISSING_DATA:'数据缺失', PRE_TBC:'TBC前',
     };
     let html = `<div class="stat-card"><div class="val">${total}</div><div class="lbl">分析总块数</div></div>`;
     html    += `<div class="stat-card"><div class="val" style="color:${mismatches?'#e74c3c':'#27ae60'}">${mismatches||'0'}</div><div class="lbl">计算不符块数</div></div>`;
@@ -616,15 +634,16 @@ function buildTableRow(r) {
         MTP12_EMERGENCY:'⚡MTP12紧急', DAA_NORMAL:'○正常DAA', HARDCODED_FORK:'★Fork锚点',
         MISSING_DATA:'?数据缺失', PRE_TBC:'—TBC前',
     };
-    return `<tr>
+    const rowClass = r.reason === 'MISSING_DATA' || r.reason === 'PRE_TBC' ? 'missing' : '';
+    return `<tr class="${rowClass}">
         <td>${r.height}</td>
         <td>${fmt(r.actualBits)}</td>
         <td>${fmt(r.computedBits)}</td>
         <td>${fmt(r.dnBits)}</td>
         <td>${fmt(r.upBits)}</td>
         <td>${r.windowAvgInterval ? r.windowAvgInterval.toFixed(0)+'s' : '-'}</td>
-        <td>${r.newBlockSpacing}s</td>
-        <td>${(r.mtp12/3600).toFixed(1)}h</td>
+        <td>${r.newBlockSpacing !== undefined ? r.newBlockSpacing+'s' : '-'}</td>
+        <td>${r.mtp12 !== undefined ? (r.mtp12/3600).toFixed(1)+'h' : '-'}</td>
         <td class="reason-${r.reason}">${RLABELS[r.reason]||r.reason}</td>
         <td>${match}</td>
       </tr>`;
