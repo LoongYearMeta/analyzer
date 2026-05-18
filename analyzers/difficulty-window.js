@@ -170,21 +170,23 @@ async function analyzeDifficultyWindow(config = {}) {
     const rows = [];
 
     for (let H = startHeight; H <= endHeight; H++) {
-        const prevBlock = blockCache.get(H - 1);
+        const prevBlock     = blockCache.get(H - 1);
+        const actualBlock0  = blockCache.get(H);
+        const blockInterval = (actualBlock0 && prevBlock) ? (actualBlock0.time - prevBlock.time) : null;
+
         if (!prevBlock) {
             rows.push({ height: H, reason: 'MISSING_DATA', actualBits: null, computedBits: null,
                         rawBits: null, upBits: null, dnBits: null, prevBits: null, match: null,
-                        windowAvgInterval: 0, newBlockSpacing: 600, mtp12: 0 });
+                        blockInterval, windowAvgInterval: 0, newBlockSpacing: 600, mtp12: 0 });
             continue;
         }
 
         // fork 硬编码点
         if (H - 1 === 824188) {
-            const ab = blockCache.get(H);
             rows.push({ height: H, reason: 'HARDCODED_FORK',
-                actualBits: ab ? parseInt(ab.bits, 16) : null,
+                actualBits: actualBlock0 ? parseInt(actualBlock0.bits, 16) : null,
                 computedBits: 0x1d00ffff, match: true,
-                windowAvgInterval: 0, newBlockSpacing: 600, mtp12: 0 });
+                blockInterval, windowAvgInterval: 0, newBlockSpacing: 600, mtp12: 0 });
             continue;
         }
 
@@ -194,7 +196,7 @@ async function analyzeDifficultyWindow(config = {}) {
         if (hPrev < P.TBC_FIRST - 1) {
             rows.push({ height: H, reason: 'PRE_TBC', actualBits: null, computedBits: null,
                         rawBits: null, upBits: null, dnBits: null, prevBits: null, match: null,
-                        windowAvgInterval: 0, newBlockSpacing: 600, mtp12: 0 });
+                        blockInterval, windowAvgInterval: 0, newBlockSpacing: 600, mtp12: 0 });
             continue;
         }
 
@@ -203,7 +205,7 @@ async function analyzeDifficultyWindow(config = {}) {
         if (!lB1 || !lB2 || !lB3) {
             rows.push({ height: H, reason: 'MISSING_DATA', actualBits: null, computedBits: null,
                         rawBits: null, upBits: null, dnBits: null, prevBits: null, match: null,
-                        windowAvgInterval: 0, newBlockSpacing: 600, mtp12: 0 });
+                        blockInterval, windowAvgInterval: 0, newBlockSpacing: 600, mtp12: 0 });
             continue;
         }
         const pindexLast = getSuitableBlock(lB1, lB2, lB3);
@@ -211,7 +213,7 @@ async function analyzeDifficultyWindow(config = {}) {
         // GetSuitableBlock(GetAncestor(hPrev-144)) → pindexFirst
         const hFirst = hPrev - 144;
         const [fB1, fB2, fB3] = [blockCache.get(hFirst), blockCache.get(hFirst-1), blockCache.get(hFirst-2)];
-        if (!fB1 || !fB2 || !fB3) { rows.push({ height: H, reason: 'MISSING_DATA' }); continue; }
+        if (!fB1 || !fB2 || !fB3) { rows.push({ height: H, reason: 'MISSING_DATA', blockInterval }); continue; }
         const pindexFirst = getSuitableBlock(fB1, fB2, fB3);
 
         // GetNewBlockSpacing
@@ -253,7 +255,7 @@ async function analyzeDifficultyWindow(config = {}) {
         const upBits       = targetToCompact(upLimit);
         const dnBits       = targetToCompact(dnLimit);
 
-        const actualBlock  = blockCache.get(H);
+        const actualBlock  = actualBlock0;
         const actualBits   = actualBlock ? parseInt(actualBlock.bits, 16) : null;
         const match        = actualBits !== null ? (computedBits === actualBits) : null;
 
@@ -267,6 +269,7 @@ async function analyzeDifficultyWindow(config = {}) {
             prevBits,
             match,
             reason,
+            blockInterval,
             windowAvgInterval: rawTimespan / 144,
             clampedTs,
             newBlockSpacing:   Number(newSpacing),
@@ -288,8 +291,8 @@ async function analyzeDifficultyWindow(config = {}) {
     };
 
     // 表头
-    const COL = [8, 12, 12, 12, 12, 10, 12, 8, 26, 4];
-    const HDR  = ['高度','实际bits','计算bits','下限bits','上限bits','窗口均间隔','NewSpacing','MTP12','原因','匹配'];
+    const COL = [8, 8, 12, 12, 12, 12, 10, 12, 8, 26, 4];
+    const HDR  = ['高度','出块间隔','实际bits','计算bits','下限bits','上限bits','窗口均间隔','NewSpacing','MTP12','原因','匹配'];
     const sep  = COL.map(w => '─'.repeat(w)).join('─┼─');
     console.log('\n' + HDR.map((h, i) => h.padEnd(COL[i])).join(' │ '));
     console.log(sep);
@@ -308,14 +311,15 @@ async function analyzeDifficultyWindow(config = {}) {
 
         console.log([
             String(r.height).padEnd(COL[0]),
-            fmt(r.actualBits).padEnd(COL[1]),
-            fmt(r.computedBits).padEnd(COL[2]),
-            fmt(r.dnBits).padEnd(COL[3]),
-            fmt(r.upBits).padEnd(COL[4]),
-            `${r.windowAvgInterval ? r.windowAvgInterval.toFixed(0)+'s' : '-'}`.padEnd(COL[5]),
-            `${r.newBlockSpacing !== undefined ? r.newBlockSpacing+'s' : '-'}`.padEnd(COL[6]),
-            `${r.mtp12 !== undefined ? (r.mtp12/3600).toFixed(1)+'h' : '-'}`.padEnd(COL[7]),
-            label.padEnd(COL[8]),
+            `${r.blockInterval != null ? r.blockInterval+'s' : '-'}`.padEnd(COL[1]),
+            fmt(r.actualBits).padEnd(COL[2]),
+            fmt(r.computedBits).padEnd(COL[3]),
+            fmt(r.dnBits).padEnd(COL[4]),
+            fmt(r.upBits).padEnd(COL[5]),
+            `${r.windowAvgInterval ? r.windowAvgInterval.toFixed(0)+'s' : '-'}`.padEnd(COL[6]),
+            `${r.newBlockSpacing !== undefined ? r.newBlockSpacing+'s' : '-'}`.padEnd(COL[7]),
+            `${r.mtp12 !== undefined ? (r.mtp12/3600).toFixed(1)+'h' : '-'}`.padEnd(COL[8]),
+            label.padEnd(COL[9]),
             matchStr,
         ].join(' │ '));
     }
@@ -385,6 +389,14 @@ async function analyzeDifficultyWindow(config = {}) {
     };
 }
 
+// ── 百分位数辅助 ─────────────────────────────────────────────────
+function percentile(arr, p) {
+    const sorted = arr.filter(v => v != null && isFinite(v)).sort((a, b) => a - b);
+    if (!sorted.length) return null;
+    const idx = Math.min(Math.floor(sorted.length * p / 100), sorted.length - 1);
+    return sorted[idx];
+}
+
 // ── HTML 报告生成（多数据集折线图）────────────────────────────────
 function buildHTML(rows, startH, endH, outputDir) {
     const labels      = rows.map(r => r.height);
@@ -392,8 +404,29 @@ function buildHTML(rows, startH, endH, outputDir) {
     const computedDiff= rows.map(r => r.computedBits ? +diffRatio(r.computedBits).toFixed(5) : null);
     const upDiff      = rows.map(r => r.upBits        ? +diffRatio(r.upBits).toFixed(5)       : null);
     const dnDiff      = rows.map(r => r.dnBits        ? +diffRatio(r.dnBits).toFixed(5)       : null);
-    const intervals   = rows.map(r => r.windowAvgInterval ? +r.windowAvgInterval.toFixed(1)  : null);
-    const newSpacings = rows.map(r => r.newBlockSpacing);
+    const intervals      = rows.map(r => r.windowAvgInterval ? +r.windowAvgInterval.toFixed(1) : null);
+    const blockIntervals = rows.map(r => r.blockInterval != null ? r.blockInterval : null);
+    const newSpacings    = rows.map(r => r.newBlockSpacing);
+
+    // ── 难度图 Y 轴范围：P5~P95 防止极端值压缩视图 ──
+    const allDiff = [...actualDiff, ...computedDiff, ...upDiff, ...dnDiff];
+    const diffP5  = percentile(allDiff, 5);
+    const diffP95 = percentile(allDiff, 95);
+    const diffPad = diffP5 != null && diffP95 != null ? (diffP95 - diffP5) * 0.15 : 0;
+    const diffYMin = diffP5  != null ? +(Math.max(0, diffP5  - diffPad)).toFixed(4) : undefined;
+    const diffYMax = diffP95 != null ? +(diffP95 + diffPad).toFixed(4) : undefined;
+
+    // ── 间隔图：左轴（均值/spacing）范围 ──
+    const smoothSeries = [...intervals, ...newSpacings].filter(v => v != null && isFinite(v));
+    const smoothP5  = percentile(smoothSeries, 2);
+    const smoothP95 = percentile(smoothSeries, 98);
+    const smoothPad = smoothP5 != null && smoothP95 != null ? (smoothP95 - smoothP5) * 0.15 : 60;
+    const smoothYMin = smoothP5  != null ? Math.max(0, smoothP5  - smoothPad) : 0;
+    const smoothYMax = smoothP95 != null ? smoothP95 + smoothPad : 1200;
+
+    // ── 间隔图：右轴（单块出块时间）范围，P95 截断尖峰 ──
+    const blkP95 = percentile(blockIntervals, 95);
+    const blkYMax = blkP95 != null ? Math.max(blkP95 * 1.3, 1200) : 3600;
 
     // 原因颜色映射
     const reasonColorMap = {
@@ -434,6 +467,7 @@ canvas{max-height:350px}
 .stat-card .lbl{font-size:12px;color:#888;margin-top:4px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 thead tr{background:#f0f4f8}
+th{position:sticky;top:0;background:#f0f4f8;z-index:10;box-shadow:0 1px 0 #dde3ea}
 th,td{padding:7px 10px;text-align:left;border-bottom:1px solid #eee}
 tr:hover td{background:#fafafa}
 .match-ok{color:#27ae60;font-weight:700}
@@ -482,7 +516,7 @@ tr.missing td{opacity:.5;background:#f5f5f5}
   <table>
     <thead>
       <tr>
-        <th>高度</th><th>实际 bits</th><th>计算 bits</th>
+        <th>高度</th><th>出块间隔</th><th>实际 bits</th><th>计算 bits</th>
         <th>下限 bits</th><th>上限 bits</th>
         <th>窗口均间隔</th><th>NewSpacing</th><th>MTP12</th>
         <th>原因</th><th>匹配</th>
@@ -550,13 +584,18 @@ const labels = ${JSON.stringify(labels)};
       },
       scales:{
         x:{title:{display:true,text:'区块高度'}, ticks:{maxTicksLimit:20}},
-        y:{title:{display:true,text:'难度比（1.0=最低难度）'}, beginAtZero:false}
+        y:{
+          title:{display:true,text:'难度比（1.0=最低难度）'},
+          beginAtZero:false,
+          suggestedMin:${diffYMin},
+          suggestedMax:${diffYMax}
+        }
       }
     }
   });
 })();
 
-// ── 间隔折线图 ──
+// ── 间隔折线图（双Y轴：左=均值/NewSpacing，右=单块出块时间）──
 (function(){
   const ctx = document.getElementById('intervalChart').getContext('2d');
   new Chart(ctx, {
@@ -565,28 +604,53 @@ const labels = ${JSON.stringify(labels)};
       labels,
       datasets:[
         { label:'窗口均间隔(s)', data:${JSON.stringify(intervals)},
-          borderColor:'#8e44ad', backgroundColor:'rgba(142,68,173,.06)',
-          borderWidth:2, fill:true, tension:.3, pointRadius:0 },
+          yAxisID:'yLeft',
+          borderColor:'#8e44ad', backgroundColor:'rgba(142,68,173,.08)',
+          borderWidth:2.5, fill:true, tension:.3, pointRadius:0 },
         { label:'NewBlockSpacing(s)', data:${JSON.stringify(newSpacings)},
-          borderColor:'#f39c12', borderWidth:1.5, borderDash:[4,3],
+          yAxisID:'yLeft',
+          borderColor:'#f39c12', borderWidth:2, borderDash:[5,3],
           fill:false, tension:0, pointRadius:0 },
         { label:'目标600s', data:${JSON.stringify(labels.map(() => 600))},
-          borderColor:'rgba(0,0,0,.2)', borderWidth:1, borderDash:[2,6],
+          yAxisID:'yLeft',
+          borderColor:'rgba(0,0,0,.18)', borderWidth:1, borderDash:[2,6],
           fill:false, pointRadius:0 },
+        { label:'出块间隔(s) ▶右轴', data:${JSON.stringify(blockIntervals)},
+          yAxisID:'yRight',
+          borderColor:'rgba(22,160,133,.55)', backgroundColor:'rgba(22,160,133,.04)',
+          borderWidth:1, fill:false, tension:.1, pointRadius:1.5,
+          pointBackgroundColor:'rgba(22,160,133,.5)' },
       ]
     },
     options:{
       responsive:true, maintainAspectRatio:false,
       plugins:{
         legend:{
-          display: true,
-          position: 'top',
-          labels: { boxWidth: 24, padding: 14, font: { size: 12 } }
+          display:true, position:'top',
+          labels:{ boxWidth:24, padding:14, font:{ size:12 } }
+        },
+        tooltip:{
+          callbacks:{
+            title: ctx => '高度: ' + ctx[0].label,
+          }
         }
       },
       scales:{
         x:{title:{display:true,text:'区块高度'}, ticks:{maxTicksLimit:20}},
-        y:{title:{display:true,text:'秒'}, beginAtZero:false}
+        yLeft:{
+          position:'left',
+          title:{display:true,text:'秒（均值/NewSpacing）'},
+          suggestedMin:${smoothYMin},
+          suggestedMax:${smoothYMax},
+          grid:{drawOnChartArea:true}
+        },
+        yRight:{
+          position:'right',
+          title:{display:true,text:'单块出块时间(s)'},
+          suggestedMin:0,
+          suggestedMax:${blkYMax},
+          grid:{drawOnChartArea:false}
+        }
       }
     }
   });
@@ -637,6 +701,7 @@ function buildTableRow(r) {
     const rowClass = r.reason === 'MISSING_DATA' || r.reason === 'PRE_TBC' ? 'missing' : '';
     return `<tr class="${rowClass}">
         <td>${r.height}</td>
+        <td>${r.blockInterval != null ? r.blockInterval+'s' : '-'}</td>
         <td>${fmt(r.actualBits)}</td>
         <td>${fmt(r.computedBits)}</td>
         <td>${fmt(r.dnBits)}</td>
