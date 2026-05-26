@@ -102,7 +102,7 @@ async function analyzeBlockInterval(config = {}) {
 
         for (let height = h; height <= batchEnd; height++) {
             promises.push(
-                rpc.getBlock(height, 1)
+                rpc.getBlockHeader(height)
                     .then(block => ({
                         height,
                         time: block.time,

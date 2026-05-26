@@ -65,8 +65,15 @@ function targetToCompact(target) {
 }
 
 // ── GetSuitableBlock：3块时间中位数（pow.cpp:290） ────────────────
+// Exact replication of the C++ sorting network.
+// C++ receives pindex and sets blocks[0]=pindex->pprev->pprev, blocks[1]=pindex->pprev, blocks[2]=pindex.
+// Callers pass (pindex, pindex->pprev, pindex->pprev->pprev), so b0=newest, b2=oldest.
 function getSuitableBlock(b0, b1, b2) {
-    return [b0, b1, b2].slice().sort((a, b) => a.time - b.time)[1];
+    let blk = [b2, b1, b0]; // match C++ blocks[0..2]
+    if (blk[0].time > blk[2].time) { const t = blk[0]; blk[0] = blk[2]; blk[2] = t; }
+    if (blk[0].time > blk[1].time) { const t = blk[0]; blk[0] = blk[1]; blk[1] = t; }
+    if (blk[1].time > blk[2].time) { const t = blk[1]; blk[1] = blk[2]; blk[2] = t; }
+    return blk[1];
 }
 
 // ── ComputeTarget（pow.cpp:246） ──────────────────────────────────
@@ -76,8 +83,8 @@ function computeTarget(first, last, newBlockSpacing) {
 
     let work            = (lastWork - firstWork) * newBlockSpacing;
     const rawTimespan   = BigInt(last.time - first.time);
-    const minTs         = 72n  * P.SPACING;
-    const maxTs         = 288n * P.SPACING;
+    const minTs         = 72n  * newBlockSpacing;   // clamp uses newBlockSpacing, not fixed 600
+    const maxTs         = 288n * newBlockSpacing;
     let   clampedTs     = rawTimespan < minTs ? minTs : rawTimespan > maxTs ? maxTs : rawTimespan;
 
     work /= clampedTs;
@@ -150,7 +157,7 @@ async function analyzeDifficultyWindow(config = {}) {
                 Array.from({ length: bEnd - h + 1 }, (_, i) => h + i)
                     .filter(height => !blockCache.has(height))
                     .map(height =>
-                        rpc.getBlock(height, 1)
+                        rpc.getBlockHeader(height)
                             .then(b  => blockCache.set(height, b))
                             .catch(() => null)
                     )
@@ -261,6 +268,7 @@ async function analyzeDifficultyWindow(config = {}) {
 
         rows.push({
             height:            H,
+            timestamp:         actualBlock0?.time ?? prevBlock?.time ?? null,
             actualBits,
             computedBits,
             rawBits,
@@ -399,14 +407,18 @@ function percentile(arr, p) {
 
 // ── HTML 报告生成（多数据集折线图）────────────────────────────────
 function buildHTML(rows, startH, endH, outputDir) {
-    const labels      = rows.map(r => r.height);
-    const actualDiff  = rows.map(r => r.actualBits   ? +diffRatio(r.actualBits).toFixed(5)   : null);
-    const computedDiff= rows.map(r => r.computedBits ? +diffRatio(r.computedBits).toFixed(5) : null);
-    const upDiff      = rows.map(r => r.upBits        ? +diffRatio(r.upBits).toFixed(5)       : null);
-    const dnDiff      = rows.map(r => r.dnBits        ? +diffRatio(r.dnBits).toFixed(5)       : null);
-    const intervals      = rows.map(r => r.windowAvgInterval ? +r.windowAvgInterval.toFixed(1) : null);
-    const blockIntervals = rows.map(r => r.blockInterval != null ? r.blockInterval : null);
-    const newSpacings    = rows.map(r => r.newBlockSpacing);
+    const heights    = rows.map(r => r.height);
+    const timestamps = rows.map(r => r.timestamp ?? null); // Unix seconds
+    const xMin = timestamps.find(t => t != null);
+    const xMax = [...timestamps].reverse().find(t => t != null);
+    const actualDiff   = rows.map(r => ({ x: r.timestamp, y: r.actualBits   ? +diffRatio(r.actualBits).toFixed(5)   : null }));
+    const computedDiff = rows.map(r => ({ x: r.timestamp, y: r.computedBits ? +diffRatio(r.computedBits).toFixed(5) : null }));
+    const upDiff       = rows.map(r => ({ x: r.timestamp, y: r.upBits       ? +diffRatio(r.upBits).toFixed(5)       : null }));
+    const dnDiff       = rows.map(r => ({ x: r.timestamp, y: r.dnBits       ? +diffRatio(r.dnBits).toFixed(5)       : null }));
+    const intervals      = rows.map(r => ({ x: r.timestamp, y: r.windowAvgInterval ? +r.windowAvgInterval.toFixed(1) : null }));
+    const blockIntervals = rows.map(r => ({ x: r.timestamp, y: r.blockInterval != null ? r.blockInterval : null }));
+    const newSpacings    = rows.map(r => ({ x: r.timestamp, y: r.newBlockSpacing != null ? r.newBlockSpacing : null }));
+    const target600      = rows.filter(r => r.timestamp).map(r => ({ x: r.timestamp, y: 600 }));
 
     // ── 难度图 Y 轴范围：P5~P95 防止极端值压缩视图 ──
     const allDiff = [...actualDiff, ...computedDiff, ...upDiff, ...dnDiff];
@@ -448,6 +460,7 @@ function buildHTML(rows, startH, endH, outputDir) {
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>难度调整窗口分析 (${startH}–${endH})</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
 <style>
 *{box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:#f5f7fa;color:#333}
@@ -455,8 +468,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;m
 .header{background:linear-gradient(135deg,#2c3e50,#3498db);color:#fff;padding:28px;border-radius:12px;margin-bottom:20px}
 .header h1{margin:0 0 8px 0;font-size:22px}
 .header p{margin:0;opacity:.85;font-size:14px}
-.card{background:#fff;padding:20px;border-radius:12px;margin-bottom:20px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+.card{background:#fff;padding:20px;border-radius:12px;margin-bottom:20px;box-shadow:0 2px 8px rgba(0,0,0,.06);position:relative}
 .card h2{margin:0 0 14px 0;font-size:16px;color:#555}
+.zoom-hint{font-size:11px;color:#aaa;margin:0 0 6px 0}
+.reset-btn{position:absolute;top:16px;right:16px;padding:4px 10px;font-size:12px;border:1px solid #d0d7de;border-radius:6px;background:#f6f8fa;color:#555;cursor:pointer;display:none}
+.reset-btn.visible{display:inline-block}
+.reset-btn:hover{background:#e9ecef}
 canvas{max-height:350px}
 .legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:10px;font-size:13px}
 .legend-item{display:flex;align-items:center;gap:6px}
@@ -496,6 +513,8 @@ tr.missing td{opacity:.5;background:#f5f5f5}
 
 <div class="card">
   <h2>难度比变化（相对最低难度 1.0 = bits: 1d00ffff）</h2>
+  <button class="reset-btn" id="resetDiff" onclick="resetZoom('diffChart','resetDiff')">重置缩放</button>
+  <p class="zoom-hint">拖拽选区放大 · 点击"重置缩放"还原</p>
   <canvas id="diffChart"></canvas>
   <p style="margin:8px 0 0 0;font-size:12px;color:#888">
     实线散点颜色：
@@ -508,6 +527,8 @@ tr.missing td{opacity:.5;background:#f5f5f5}
 
 <div class="card">
   <h2>144块窗口平均出块间隔（秒）&amp; GetNewBlockSpacing</h2>
+  <button class="reset-btn" id="resetInterval" onclick="resetZoom('intervalChart','resetInterval')">重置缩放</button>
+  <p class="zoom-hint">拖拽选区放大 · 点击"重置缩放"还原</p>
   <canvas id="intervalChart"></canvas>
 </div>
 
@@ -516,7 +537,7 @@ tr.missing td{opacity:.5;background:#f5f5f5}
   <table>
     <thead>
       <tr>
-        <th>高度</th><th>出块间隔</th><th>实际 bits</th><th>计算 bits</th>
+        <th>高度</th><th>时间</th><th>出块间隔</th><th>实际 bits</th><th>计算 bits</th>
         <th>下限 bits</th><th>上限 bits</th>
         <th>窗口均间隔</th><th>NewSpacing</th><th>MTP12</th>
         <th>原因</th><th>匹配</th>
@@ -531,7 +552,33 @@ tr.missing td{opacity:.5;background:#f5f5f5}
 </div><!-- /container -->
 
 <script>
-const labels = ${JSON.stringify(labels)};
+const heights    = ${JSON.stringify(heights)};
+const timestamps = ${JSON.stringify(timestamps)};
+const xMin = ${JSON.stringify(xMin)};
+const xMax = ${JSON.stringify(xMax)};
+function fmtTick(v) {
+    const d = new Date(v * 1000);
+    return (d.getMonth()+1)+'-'+d.getDate()+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+}
+const xScale = {
+    type:'linear', min:xMin, max:xMax,
+    title:{display:true, text:'时间'},
+    ticks:{ callback: fmtTick, maxTicksLimit:12 }
+};
+const zoomPlugin = {
+    zoom:{
+        drag:{ enabled:true, borderColor:'rgba(52,152,219,0.4)', borderWidth:1, backgroundColor:'rgba(52,152,219,0.08)' },
+        mode:'x',
+        onZoomComplete({ chart }) {
+            const btnId = chart.canvas.id === 'diffChart' ? 'resetDiff' : 'resetInterval';
+            document.getElementById(btnId).classList.add('visible');
+        }
+    }
+};
+function resetZoom(canvasId, btnId) {
+    Chart.getChart(canvasId).resetZoom();
+    document.getElementById(btnId).classList.remove('visible');
+}
 
 // ── 难度比折线图 ──
 (function(){
@@ -539,7 +586,6 @@ const labels = ${JSON.stringify(labels)};
   new Chart(ctx, {
     type: 'line',
     data: {
-      labels,
       datasets: [
         { label:'实际 bits', data:${JSON.stringify(actualDiff)},
           borderColor:'#2c3e50', backgroundColor:'rgba(44,62,80,.08)',
@@ -559,6 +605,7 @@ const labels = ${JSON.stringify(labels)};
     options: {
       responsive:true, maintainAspectRatio:false,
       plugins:{
+        zoom: zoomPlugin,
         legend:{
           display: true,
           position: 'top',
@@ -566,7 +613,11 @@ const labels = ${JSON.stringify(labels)};
         },
         tooltip:{
           callbacks:{
-            title: ctx => '高度: ' + ctx[0].label,
+            title: ctx => {
+              const i = ctx[0].dataIndex;
+              const t = timestamps[i];
+              return '高度: ' + heights[i] + (t ? ' | ' + new Date(t*1000).toLocaleString('zh-CN') : '');
+            },
             afterBody: (ctx) => {
               const i = ctx[0].dataIndex;
               const reasons = ${JSON.stringify(rows.map(r => r.reason))};
@@ -583,7 +634,7 @@ const labels = ${JSON.stringify(labels)};
         }
       },
       scales:{
-        x:{title:{display:true,text:'区块高度'}, ticks:{maxTicksLimit:20}},
+        x: xScale,
         y:{
           title:{display:true,text:'难度比（1.0=最低难度）'},
           beginAtZero:false,
@@ -601,7 +652,6 @@ const labels = ${JSON.stringify(labels)};
   new Chart(ctx, {
     type:'line',
     data:{
-      labels,
       datasets:[
         { label:'窗口均间隔(s)', data:${JSON.stringify(intervals)},
           yAxisID:'yLeft',
@@ -611,7 +661,7 @@ const labels = ${JSON.stringify(labels)};
           yAxisID:'yLeft',
           borderColor:'#f39c12', borderWidth:2, borderDash:[5,3],
           fill:false, tension:0, pointRadius:0 },
-        { label:'目标600s', data:${JSON.stringify(labels.map(() => 600))},
+        { label:'目标600s', data:${JSON.stringify(target600)},
           yAxisID:'yLeft',
           borderColor:'rgba(0,0,0,.18)', borderWidth:1, borderDash:[2,6],
           fill:false, pointRadius:0 },
@@ -625,18 +675,23 @@ const labels = ${JSON.stringify(labels)};
     options:{
       responsive:true, maintainAspectRatio:false,
       plugins:{
+        zoom: zoomPlugin,
         legend:{
           display:true, position:'top',
           labels:{ boxWidth:24, padding:14, font:{ size:12 } }
         },
         tooltip:{
           callbacks:{
-            title: ctx => '高度: ' + ctx[0].label,
+            title: ctx => {
+              const i = ctx[0].dataIndex;
+              const t = timestamps[i];
+              return '高度: ' + heights[i] + (t ? ' | ' + new Date(t*1000).toLocaleString('zh-CN') : '');
+            }
           }
         }
       },
       scales:{
-        x:{title:{display:true,text:'区块高度'}, ticks:{maxTicksLimit:20}},
+        x: xScale,
         yLeft:{
           position:'left',
           title:{display:true,text:'秒（均值/NewSpacing）'},
@@ -699,8 +754,10 @@ function buildTableRow(r) {
         MISSING_DATA:'?数据缺失', PRE_TBC:'—TBC前',
     };
     const rowClass = r.reason === 'MISSING_DATA' || r.reason === 'PRE_TBC' ? 'missing' : '';
+    const timeStr  = r.timestamp ? new Date(r.timestamp * 1000).toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}) : '-';
     return `<tr class="${rowClass}">
         <td>${r.height}</td>
+        <td style="white-space:nowrap;font-size:12px;color:#666">${timeStr}</td>
         <td>${r.blockInterval != null ? r.blockInterval+'s' : '-'}</td>
         <td>${fmt(r.actualBits)}</td>
         <td>${fmt(r.computedBits)}</td>
