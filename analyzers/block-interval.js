@@ -259,63 +259,87 @@ async function analyzeBlockInterval(config = {}) {
     if (config.html) {
         const builder = new HTMLChartBuilder();
 
-        // 散点图（与 chain_analyzer.go 等效）
+        // 散点图 - Y轴用实际分钟数 + 对数刻度，min 锁到真实数据下边界
+        const minPosIntervalMin = Math.min(...intervalValues.filter(v => v > 0)) / 60;
+        const logYMin = parseFloat((minPosIntervalMin * 0.5).toFixed(4));
+
         builder.addScatterTimeChart(
-            scatterData.map(d => ({
-                x: d.x,
-                y: d.y,
-                height: d.height,
-                interval: d.interval,
-                zero: d.isZero
+            intervals.map(item => ({
+                x: item.timestamp,
+                y: item.interval > 0 ? item.interval / 60 : logYMin,
+                height: item.toHeight,
+                interval: item.interval,
+                zero: item.interval <= 0
             })),
             {
-                title: `出块时间间隔散点图 (${normalized.useSqrt ? '√' : '线性'}归一化 0-100，最大 ${normalized.maxInterval}秒)`,
-                height: 120,
-                avgLine: avgIntervalNorm,
+                title: `出块时间间隔散点图`,
+                avgLine: secondsPerBlock / 60,
                 avgLabel: '平均出块时间',
                 avgColor: '#27ae60',
                 xLabel: '时间',
-                yLabel: '归一化间隔',
-                yMin: 0,
-                yMax: 120,
+                yLabel: '间隔时间 (m)',
+                useLogScale: true,
+                yMin: logYMin,
                 colorFn: (d) => getColor(d.interval, secondsPerBlock),
                 pointStyleFn: (d) => d.zero ? 'star' : 'circle',
                 pointRadiusFn: (d) => d.zero ? 7 : 3,
-                tooltip: {
-                    title: (ctx) => {
-                        const r = ctx[0].raw;
-                        return `高度: ${r.height} | 时间: ${new Date(r.x * 1000).toLocaleString('zh-CN')}`;
-                    },
-                    label: (ctx) => {
-                        const r = ctx.raw;
-                        if (r.zero) {
-                            return ['Warning: 异常出块！', `实际间隔: ${r.interval} 秒`];
-                        }
-                        const realInterval = r.interval;
-                        const rate = 3600 / realInterval;
-                        return [
-                            `归一化: ${r.y.toFixed(1)}`,
-                            `实际间隔: ${realInterval} 秒`,
-                            `相当于: ${rate.toFixed(2)} 块/小时`
-                        ];
-                    }
-                }
             }
         );
 
-        // 分布柱状图
+        // 分布直方图（含正态分布曲线对比）
+        const validIntervalVals = intervalValues.filter(v => v > 0);
+        const mu = intervalStats.mean;
+        const sigma = intervalStats.stdDev;
+        // Freedman-Diaconis 规则：h = 2 × IQR × N^(-1/3)，对极端值鲁棒
+        const sortedVals = [...validIntervalVals].sort((a, b) => a - b);
+        const q1 = sortedVals[Math.floor(sortedVals.length * 0.25)];
+        const q3 = sortedVals[Math.floor(sortedVals.length * 0.75)];
+        const iqr = q3 - q1;
+        const fdWidth = 2 * iqr * Math.pow(validIntervalVals.length, -1 / 3);
+        const mainBinWidth = Math.max(5, Math.round(fdWidth));
+        const numMainBins = Math.ceil(intervalStats.p99 / mainBinWidth);
+        const outlierMin = numMainBins * mainBinWidth;
+
+        const fineBinLabels = [];
+        const fineBinCounts = [];
+        const fineBinColors = [];
+        const normalCurveData = [];
+        const binRanges = [];
+
+        for (let i = 0; i < numMainBins; i++) {
+            const binMin = i * mainBinWidth;
+            const binMax = (i + 1) * mainBinWidth;
+            const binCenter = binMin + mainBinWidth / 2;
+            const count = validIntervalVals.filter(v => v >= binMin && v < binMax).length;
+            fineBinLabels.push(i % 5 === 0 ? `${binMin}s` : '');
+            fineBinCounts.push(count);
+            fineBinColors.push(binCenter < 60 ? '#27ae60' : binCenter < 300 ? '#3498db' : '#e74c3c');
+            binRanges.push({ min: binMin, max: binMax });
+            const pdf = sigma > 0
+                ? (1 / (sigma * Math.sqrt(2 * Math.PI))) * Math.exp(-0.5 * Math.pow((binCenter - mu) / sigma, 2))
+                : 0;
+            normalCurveData.push(parseFloat((pdf * validIntervalVals.length * mainBinWidth).toFixed(2)));
+        }
+        const outlierCount = validIntervalVals.filter(v => v >= outlierMin).length;
+        if (outlierCount > 0) {
+            fineBinLabels.push(`>${outlierMin}s`);
+            fineBinCounts.push(outlierCount);
+            fineBinColors.push('#e74c3c');
+            normalCurveData.push(0);
+            binRanges.push({ min: outlierMin, max: Infinity });
+        }
+
         builder.addBarChart(
-            intervalDist.map(d => d.label),
-            intervalDist.map(d => d.count),
+            fineBinLabels,
+            fineBinCounts,
             {
-                title: '间隔时间分布',
-                height: 80,
+                title: '间隔时间分布（正态分布曲线对比）',
                 xLabel: '时间间隔',
                 yLabel: '频次',
-                colors: intervalDist.map(d => {
-                    const avg = parseFloat(d.label);
-                    return avg < 60 ? '#27ae60' : avg < 300 ? '#3498db' : '#e74c3c';
-                })
+                colors: fineBinColors,
+                normalCurve: normalCurveData,
+                binRanges,
+                totalCount: validIntervalVals.length
             }
         );
 
