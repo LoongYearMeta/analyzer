@@ -171,9 +171,8 @@ async function analyzeTxCount(config = {}) {
             chartData.trend.values,
             {
                 title: '交易数量趋势',
-                height: 100,
                 label: '交易数量',
-                color: 'rgb(102, 126, 234)',
+                borderColor: 'rgb(102, 126, 234)',
                 backgroundColor: 'rgba(102, 126, 234, 0.1)',
                 fill: true,
                 tension: 0.4,
