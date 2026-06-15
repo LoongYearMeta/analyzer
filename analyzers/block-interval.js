@@ -144,14 +144,17 @@ async function analyzeBlockInterval(config = {}) {
     }
 
     const intervalValues = intervals.map(i => i.interval);
-    const intervalStats = analyze(intervalValues);
+    const validIntervalValues = intervalValues.filter(v => v > 0);
+    const intervalStats = analyze(validIntervalValues);
+    const mu = intervalStats.mean;
+    const sigma = intervalStats.stdDev;
 
     // 时间范围
     const minTime = Math.min(...blocks.map(t => t.time));
     const maxTime = Math.max(...blocks.map(t => t.time));
     const totalDuration = maxTime - minTime;
-    const blocksPerSecond = blocks.length / totalDuration;
-    const secondsPerBlock = totalDuration / blocks.length;
+    const secondsPerBlock = totalDuration / (blocks.length - 1);
+    const blocksPerSecond = 1 / secondsPerBlock;
 
     // 归一化（与 chain_analyzer.go 一致）
     const useSqrt = config.linear !== true;
@@ -273,8 +276,8 @@ async function analyzeBlockInterval(config = {}) {
             })),
             {
                 title: `出块时间间隔散点图`,
-                avgLine: secondsPerBlock / 60,
-                avgLabel: '平均出块时间',
+                avgLine: mu / 60,
+                avgLabel: `平均出块时间 ${mu.toFixed(1)}s`,
                 avgColor: '#27ae60',
                 xLabel: '时间',
                 yLabel: '间隔时间 (m)',
@@ -287,9 +290,7 @@ async function analyzeBlockInterval(config = {}) {
         );
 
         // 分布直方图（含正态分布曲线对比）
-        const validIntervalVals = intervalValues.filter(v => v > 0);
-        const mu = intervalStats.mean;
-        const sigma = intervalStats.stdDev;
+        const validIntervalVals = validIntervalValues;
         // Freedman-Diaconis 规则：h = 2 × IQR × N^(-1/3)，对极端值鲁棒
         const sortedVals = [...validIntervalVals].sort((a, b) => a - b);
         const q1 = sortedVals[Math.floor(sortedVals.length * 0.25)];
@@ -306,6 +307,10 @@ async function analyzeBlockInterval(config = {}) {
         const normalCurveData = [];
         const binRanges = [];
 
+        // 比特币理论指数分布：λ=1/600（泊松出块过程）
+        const BTC_LAMBDA = 1 / 600;
+        const theoreticalCurveData = [];
+
         for (let i = 0; i < numMainBins; i++) {
             const binMin = i * mainBinWidth;
             const binMax = (i + 1) * mainBinWidth;
@@ -319,6 +324,8 @@ async function analyzeBlockInterval(config = {}) {
                 ? (1 / (sigma * Math.sqrt(2 * Math.PI))) * Math.exp(-0.5 * Math.pow((binCenter - mu) / sigma, 2))
                 : 0;
             normalCurveData.push(parseFloat((pdf * validIntervalVals.length * mainBinWidth).toFixed(2)));
+            const pdfBtc = BTC_LAMBDA * Math.exp(-BTC_LAMBDA * binCenter);
+            theoreticalCurveData.push(parseFloat((pdfBtc * validIntervalVals.length * mainBinWidth).toFixed(2)));
         }
         const outlierCount = validIntervalVals.filter(v => v >= outlierMin).length;
         if (outlierCount > 0) {
@@ -326,6 +333,7 @@ async function analyzeBlockInterval(config = {}) {
             fineBinCounts.push(outlierCount);
             fineBinColors.push('#e74c3c');
             normalCurveData.push(0);
+            theoreticalCurveData.push(0);
             binRanges.push({ min: outlierMin, max: Infinity });
         }
 
@@ -333,15 +341,50 @@ async function analyzeBlockInterval(config = {}) {
             fineBinLabels,
             fineBinCounts,
             {
-                title: '间隔时间分布（正态分布曲线对比）',
+                title: '间隔时间分布（正态拟合 vs 指数分布参考）',
                 xLabel: '时间间隔',
                 yLabel: '频次',
                 colors: fineBinColors,
                 normalCurve: normalCurveData,
+                normalCurve2: theoreticalCurveData,
                 binRanges,
                 totalCount: validIntervalVals.length
             }
         );
+
+        // 长尾概率说明
+        const btcMu = 600;
+        const p30  = Math.exp(-1800 / btcMu);
+        const p60  = Math.exp(-3600 / btcMu);
+        const p120 = Math.exp(-7200 / btcMu);
+        builder.addNote(`
+            <h3>关于指数分布的长尾</h3>
+            <p>
+                PoW 出块过程本质是泊松过程：每次 hash 尝试相互独立，成功概率极小。
+                两次出块之间的等待时间服从<strong>指数分布</strong>，其生存函数为：
+            </p>
+            <p style="font-family:monospace; background:#eef; display:inline-block; padding:4px 10px; border-radius:4px;">
+                P(T &gt; t) = e<sup>−t/μ</sup>
+            </p>
+            <p>
+                其中 μ 为平均出块时间（本链实测有效间隔均值 <strong>${mu.toFixed(1)}s / ${(mu/60).toFixed(2)}min</strong>，即散点图图例中绿色平均线标注值）。
+                指数分布的关键特性是<strong>无记忆性</strong>：
+                已经等待了 9 分钟，下一秒出块的概率与刚开始完全相同，历史等待时间不提供任何信息。
+            </p>
+            <p>以比特币目标 μ=600s 为基准，超过以下时间的理论概率：</p>
+            <table>
+                <tr><th>等待时长</th><th>P(T &gt; t)</th><th>约每多少块出现一次</th></tr>
+                <tr><td>30 分钟</td><td>${(p30 * 100).toFixed(2)}%</td><td>约每 ${Math.round(1/p30)} 块一次</td></tr>
+                <tr><td>60 分钟</td><td>${(p60 * 100).toFixed(3)}%</td><td>约每 ${Math.round(1/p60)} 块一次</td></tr>
+                <tr><td>120 分钟</td><td>${(p120 * 100).toFixed(5)}%</td><td>约每 ${Math.round(1/p120).toLocaleString()} 块一次</td></tr>
+            </table>
+            <p>
+                数学上指数分布支持集为 [0, +∞)，<strong>不存在理论上限</strong>。
+                几小时的长间隔虽然罕见，但并不违反统计规律。
+                图中紫色虚线（指数分布参考曲线）从左侧单调递减，
+                若实测柱状图在右侧明显高于紫线，说明该链存在非泊松因素（如算力突变、难度调整滞后等）。
+            </p>
+        `);
 
         // 保存 HTML
         const htmlPath = builder
