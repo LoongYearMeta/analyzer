@@ -213,68 +213,101 @@ function loadPrevhashRecords(filePath) {
     } catch { return []; }
 }
 
-// ============ 多解检测 + 胜出解判定 ============
+// ============ canonical 链重建（反向溯链 + 去重 + 排除分叉）============
 //
-// 同一 block_height 出现多条记录 = 多解竞争。
-// 胜出解判定：下一高度(H+1)记录的 prev_hash 指向 H 高度真正被接续的区块，
-// 因此 H 高度中 block_hash == (H+1).prev_hash 的那条即胜出解，其余为孤块/落败解。
-function detectSolutions(records) {
-    const byHeight = new Map();
+// 设计（支持多池直接拼接，同链由调用方保证）：
+//   1) 按 block_hash 去重：同一区块被多个池各记一条 → 只算一个，保留最早 pool_submit_time
+//      （最接近真实出块时刻），并累计见过它的 pool_signature 集合；
+//   2) 从最高高度沿 prev_hash 一路回溯（prev_hash → 父块 block_hash），得到唯一最长正确链；
+//      不在这条链上的块即孤块/分叉，自动排除（多池多分叉也这样被剔掉）；
+//   3) 中断标记：若回溯到的链最低高度 > 数据最低高度（中间断链），记下断点；
+//   4) 高度-时间反向校验：canonical 链上更高高度的 pool_submit_time 不应早于更低高度，
+//      违反即异常（链溯错 / 时钟回拨）——表现为相邻 interval ≤ 0，由 flagAnomalies 标出。
+function buildChainView(records) {
+    const norm = normHash;
+
+    // 1) 去重：同 block_hash 合并，取最早 pool_submit_ms 的那条，累计 pool_signature
+    const byHash = new Map();
     for (const r of records) {
-        if (r.block_height == null) continue;
-        if (!byHeight.has(r.block_height)) byHeight.set(r.block_height, []);
-        byHeight.get(r.block_height).push(r);
-    }
-
-    for (const [h, group] of byHeight) {
-        const next = byHeight.get(h + 1);
-        const winnerHashes = next
-            ? new Set(next.map(n => normHash(n.prev_hash)).filter(Boolean))
-            : null;
-
-        for (const r of group) {
-            r.solutionCount = group.length;
-            r.isMultiSolution = group.length > 1;
-            if (winnerHashes) {
-                r.isWinner = winnerHashes.has(normHash(r.block_hash));
-                r.isOrphan = !r.isWinner;
-                r.winnerKnown = true;
-            } else {
-                // 最新高度尚无后续块可佐证：单解默认视为胜出，多解标为未决
-                r.winnerKnown = group.length === 1;
-                r.isWinner = group.length === 1;
-                r.isOrphan = false;
+        if (r.block_height == null || !r.block_hash) continue;
+        const key = norm(r.block_hash);
+        const ex = byHash.get(key);
+        if (!ex) {
+            byHash.set(key, { ...r, _pools: new Set(r.pool_signature != null ? [r.pool_signature] : []) });
+        } else {
+            if (r.pool_signature != null) ex._pools.add(r.pool_signature);
+            if (r.pool_submit_ms != null && (ex.pool_submit_ms == null || r.pool_submit_ms < ex.pool_submit_ms)) {
+                byHash.set(key, { ...r, _pools: ex._pools });
             }
         }
     }
-    return byHeight;
-}
+    const unique = [...byHash.values()];
 
-// ============ 胜出链 + 出块间隔 ============
-//
-// 取每个高度的胜出解，按高度排序，用 pool_submit_ms 计算相邻间隔。
-function buildChain(byHeight) {
-    const winners = [];
-    for (const [h, group] of byHeight) {
-        let w = group.find(r => r.isWinner);
-        if (!w && group.length === 1) w = group[0];
-        if (!w) w = group.slice().sort((a, b) => (a.pool_submit_ms || 0) - (b.pool_submit_ms || 0))[0]; // 未决：取最早提交
-        winners.push(w);
+    // 2) 按高度分组（去重后）：同高度多个不同 hash = 真实竞争
+    const byHeight = new Map();
+    for (const r of unique) {
+        if (!byHeight.has(r.block_height)) byHeight.set(r.block_height, []);
+        byHeight.get(r.block_height).push(r);
     }
-    winners.sort((a, b) => a.block_height - b.block_height);
+    const pools = new Set();
+    for (const r of unique) for (const p of (r._pools || [])) pools.add(p);
 
-    const chain = [];
-    for (let i = 0; i < winners.length; i++) {
-        const w = winners[i];
-        const prev = winners[i - 1];
+    if (unique.length === 0) {
+        return { chain: [], byHeight, orphans: [], competitionHeights: [], interrupted: null, pools };
+    }
+
+    // 3) 从最高高度回溯
+    const heights = unique.map(r => r.block_height);
+    const maxHeight = Math.max(...heights), minHeight = Math.min(...heights);
+    const hashIndex = new Map(unique.map(r => [norm(r.block_hash), r]));
+    const walkBack = (tip) => {
+        const path = [], seen = new Set();
+        let cur = tip;
+        while (cur && !seen.has(norm(cur.block_hash))) {
+            path.push(cur);
+            seen.add(norm(cur.block_hash));
+            cur = cur.prev_hash ? hashIndex.get(norm(cur.prev_hash)) : null;
+        }
+        return path; // tip → … → 最早可达块
+    };
+    // 链尖 = 最高高度的块；若并列竞争，取能回溯最长的一条
+    let best = [];
+    for (const tip of unique.filter(r => r.block_height === maxHeight)) {
+        const p = walkBack(tip);
+        if (p.length > best.length) best = p;
+    }
+    const onChain = new Set(best.map(r => norm(r.block_hash)));
+    const chain = best.slice().reverse(); // 最低 → 最高
+
+    // 4) 间隔 + 每记录标志（供表格/控制台沿用）
+    for (let i = 0; i < chain.length; i++) {
+        const w = chain[i], prev = chain[i - 1];
         let interval_s = null;
         if (prev && w.pool_submit_ms != null && prev.pool_submit_ms != null
             && w.block_height === prev.block_height + 1) {
             interval_s = (w.pool_submit_ms - prev.pool_submit_ms) / 1000;
         }
-        chain.push({ ...w, interval_s });
+        w.interval_s = interval_s;
+        w.isWinner = true; w.isOrphan = false; w.winnerKnown = true;
+        w.solutionCount = (byHeight.get(w.block_height) || [w]).length;
+        w.isMultiSolution = w.solutionCount > 1;
     }
-    return chain;
+
+    // 5) 孤块 / 竞争高度 / 中断
+    const orphans = unique.filter(r => !onChain.has(norm(r.block_hash)));
+    for (const r of orphans) {
+        r.isWinner = false; r.isOrphan = true; r.winnerKnown = true; r.interval_s = null;
+        r.solutionCount = (byHeight.get(r.block_height) || []).length;
+        r.isMultiSolution = r.solutionCount > 1;
+    }
+    const competitionHeights = [...byHeight.entries()]
+        .filter(([, g]) => g.length > 1).map(([h]) => h).sort((a, b) => a - b);
+
+    const chainMin = chain.length ? chain[0].block_height : null;
+    const interrupted = (chainMin != null && chainMin > minHeight)
+        ? { gapBelow: chainMin, dataLow: minHeight } : null;
+
+    return { chain, byHeight, orphans, competitionHeights, interrupted, pools };
 }
 
 // ============ 异常判定（基线公式，可迭代）============
@@ -313,8 +346,7 @@ function analyzePoolSolutions(config = {}) {
         return { info: ANALYZER_INFO, records: [] };
     }
 
-    const byHeight = detectSolutions(records);
-    const chain = buildChain(byHeight);
+    const { chain, byHeight, orphans, competitionHeights, interrupted, pools } = buildChainView(records);
 
     // 出块间隔统计（仅有效正间隔）
     const intervals = chain.map(c => c.interval_s).filter(v => v != null);
@@ -330,7 +362,10 @@ function analyzePoolSolutions(config = {}) {
     // 与 BTC 泊松出块的偏离量化
     const dev = validIntervals.length >= 2 ? quantifyDeviation(validIntervals, stats) : null;
 
-    console.log(`   记录数: ${records.length} | 高度数: ${byHeight.size} | 多解高度: ${multiHeights.length}`);
+    console.log(`   记录数: ${records.length} | 去重区块: ${byHeight.size} | canonical链: ${chain.length} | 竞争高度: ${competitionHeights.length} | 孤块: ${orphans.length} | 矿池数: ${pools.size}`);
+    if (interrupted) {
+        console.log(`   ⛓️‍💥 链中断: 仅回溯到高度 ${interrupted.gapBelow}，其下至 ${interrupted.dataLow} 未能连上（断点在 ${interrupted.gapBelow - 1}）`);
+    }
     if (validIntervals.length > 0) {
         console.log(`   出块间隔(胜出链): 均值 ${mu.toFixed(1)}s | 中位 ${stats.median.toFixed(1)}s | p99 ${stats.p99.toFixed(1)}s | min ${stats.min}s | max ${stats.max}s`);
     }
@@ -391,7 +426,8 @@ function analyzePoolSolutions(config = {}) {
         if (prevhashRecs.length) {
             console.log(`   prev_hash 传播记录: ${prevhashRecs.length} 条 (${prevhashPath})`);
         }
-        const p = buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRecs);
+        const p = buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRecs,
+            { orphans, competitionHeights, interrupted, pools });
         console.log(`\n📄 HTML 报告: ${p}`);
     }
 
@@ -464,7 +500,8 @@ function toCSV(records) {
 
 // ============ HTML 报告 ============
 
-function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRecs) {
+function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRecs, view = {}) {
+    const { orphans = [], competitionHeights = [], interrupted = null, pools = new Set() } = view;
     const builder = new HTMLChartBuilder();
 
     // ---- 图1 难度变化图（折线连接 + 小点；Y 轴缩放到数据范围放大波动；隐藏 Y 轴数字，悬停看精确值）----
@@ -507,24 +544,55 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
     }
 
     // ---- 图: 实测网络算力（pool 基于 share 统计，10分钟滑窗 + 全程累计）----
-    const hrPts = chain.filter(c => c.hashrate_10min_hs != null || c.hashrate_total_hs != null);
-    if (hrPts.length) {
+    // 用完整 canonical 链做 X 轴，缺字段的块置 null 且 spanGaps:false →
+    // 旧记录(无算力字段)所在高度显示为**断口**，既不隐藏缺口、也不跨空连线。
+    if (chain.some(c => c.hashrate_10min_hs != null || c.hashrate_total_hs != null)) {
         builder.addMultiLineChart(
-            hrPts.map(c => `#${c.block_height}`),
+            chain.map(c => `#${c.block_height}`),
             [
-                { label: '10分钟滑窗算力 (TH/s)', data: hrPts.map(c => c.hashrate_10min_hs != null ? +(c.hashrate_10min_hs / 1e12).toFixed(3) : null), color: '#16a085' },
-                { label: '全程累计算力 (TH/s)',  data: hrPts.map(c => c.hashrate_total_hs != null ? +(c.hashrate_total_hs / 1e12).toFixed(3) : null), color: '#9b59b6', dash: [5, 3] },
+                { label: '10分钟滑窗算力 (TH/s)', data: chain.map(c => c.hashrate_10min_hs != null ? +(c.hashrate_10min_hs / 1e12).toFixed(3) : null), color: '#16a085', spanGaps: false },
+                { label: '全程累计算力 (TH/s)',  data: chain.map(c => c.hashrate_total_hs != null ? +(c.hashrate_total_hs / 1e12).toFixed(3) : null), color: '#9b59b6', dash: [5, 3], spanGaps: false },
             ],
             { title: '实测网络算力（pool 基于 share 统计 · 金标准）', xLabel: '区块高度', yLabel: '算力 (TH/s)',
               caption: '由 pool 收到的<b>每个被接受 share</b> 还原（H = Σ每share功 / 时间），'
                      + '<b>直接反映真实算力，与出块间隔无关</b>。'
                      + '<span style="color:#16a085"><b>绿线 = 10 分钟滑窗</b></span>（近期算力）、'
                      + '<span style="color:#9b59b6"><b>紫虚线 = 全程累计</b></span>（长期均值）。'
-                     + '<br><b>读法</b>：恒定算力应是一条基本水平的线。与上方“出块间隔”对照——'
-                     + '若某<b>长块</b>处算力<b>仍水平</b>，则该长块<b>不是掉算力</b>（属真随机长尾或 stale prev-hash）；'
-                     + '只有算力出现<b>持续性台阶下降</b>才是真的掉算力。'
-                     + '（仅出块时刻采样，约每 10 分钟一点；旧版 pool 记录无此字段会留空。）' }
+                     + '<br><b>读法</b>：恒定算力应是一条基本水平的线。'
+                     + '<b>线在某段断开 = 该段为旧记录、无算力字段</b>（不是掉算力，只是没数据）。'
+                     + '与“出块间隔”对照——长块处算力<b>仍水平</b>则该长块<b>不是掉算力</b>（真随机长尾或 stale prev-hash），'
+                     + '只有算力出现<b>持续性台阶下降</b>才是真掉算力。（仅出块时刻采样，约每 10 分钟一点。）' }
         );
+    }
+
+    // ---- 图: 跨池总算力（仅检测到多个 pool_signature 时显示）----
+    if (pools.size >= 2) {
+        const hrRecs = records
+            .filter(r => r.hashrate_10min_hs != null && r.pool_submit_ms != null && r.pool_signature != null)
+            .sort((a, b) => a.pool_submit_ms - b.pool_submit_ms);
+        if (hrRecs.length) {
+            const last = new Map(); // pool_signature -> 最近一次 10分钟算力 (H/s)
+            const labels = [], totals = [];
+            const fmtT = (ms) => {
+                const d = new Date(ms);
+                return `${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+            };
+            for (const r of hrRecs) {
+                last.set(r.pool_signature, r.hashrate_10min_hs);
+                let sum = 0;
+                for (const v of last.values()) sum += v;
+                labels.push(fmtT(r.pool_submit_ms));
+                totals.push(+(sum / 1e12).toFixed(3));
+            }
+            builder.addLineChart(labels, totals, {
+                title: `跨池总算力（${pools.size} 个矿池 · 10 分钟滑窗求和 · TH/s）`,
+                xLabel: '时间', yLabel: '总算力 (TH/s)', label: '跨池总算力',
+                pointRadius: 1, beginAtZero: true,
+                caption: `检测到 <b>${pools.size} 个不同 pool_signature</b>，按时间推进维护每个池最近一次的 10 分钟算力并求和 `
+                       + '= <b>全网实时总算力</b>（阶梯式：某池一出块即刷新它的分量）。'
+                       + '<br>单池时此图不显示；旧版记录无算力字段则参与求和的池数减少。'
+            });
+        }
     }
 
     // ---- 图: prev_hash 传播延迟 stale_ms（来自 pool-prevhash.ndjson，可选）----
@@ -643,8 +711,28 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
             </p>`);
     }
 
+    // ---- canonical 链重建说明（去重 + 反向溯链 + 排除分叉 + 中断标记）----
+    builder.addNote(`
+        <h3>canonical 链重建（反向溯链）</h3>
+        <p>支持<strong>多池导出文件直接拼接</strong>（同链由使用方保证）。重建步骤：
+           按 <code>block_hash</code> 去重（同一区块被多池各记一条 → 只算一个，取<strong>最早 pool_submit_time</strong>）→
+           从<strong>最高高度</strong>沿 <code>prev_hash</code> 回溯出唯一最长正确链 → 不在链上的块即<strong>孤块/分叉</strong>，自动排除。</p>
+        <table>
+            <tr><th>指标</th><th>值</th></tr>
+            <tr><td>去重后区块</td><td>${byHeight.size}</td></tr>
+            <tr><td>canonical 链长度</td><td>${chain.length}（高度 ${chain.length ? chain[0].block_height : '-'} → ${chain.length ? chain[chain.length - 1].block_height : '-'}）</td></tr>
+            <tr><td>竞争高度（同高度不同 hash）</td><td>${competitionHeights.length}${competitionHeights.length ? '：' + competitionHeights.slice(0, 20).join(', ') + (competitionHeights.length > 20 ? ' …' : '') : ''}</td></tr>
+            <tr><td>排除的孤块/分叉</td><td>${orphans.length}</td></tr>
+            <tr><td>参与矿池数（pool_signature）</td><td>${pools.size}${pools.size ? '：' + [...pools].slice(0, 8).join(', ') : ''}</td></tr>
+            <tr><td>链完整性</td><td>${interrupted
+                ? `<strong style="color:#e74c3c">⛓️‍💥 中断：仅回溯到高度 ${interrupted.gapBelow}，其下至 ${interrupted.dataLow} 未连上（断点在 ${interrupted.gapBelow - 1}）</strong>`
+                : '<strong style="color:#27ae60">✅ 完整（最高高度可回溯至最低高度）</strong>'}</td></tr>
+        </table>
+        <p style="font-size:13px;color:#666;">高度-时间反向校验：canonical 链上更高高度的 pool_submit_time 不应早于更低高度；
+           若违反会表现为相邻 <code>interval ≤ 0</code>，在下方“出块时间异常判定”中标出（链溯错 / 时钟回拨）。</p>`);
+
     // ---- 异常判定说明 ----
-    const multiCount = [...byHeight.values()].filter(g => g.length > 1).length;
+    const multiCount = competitionHeights.length;
     const anomalyCount = chain.filter(c => c.anomalies && c.anomalies.length).length;
     builder.addNote(`
         <h3>出块时间异常判定（基线公式，可迭代）</h3>
