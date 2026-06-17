@@ -46,6 +46,7 @@ const ANALYZER_INFO = {
         { name: 'json', type: 'boolean', description: '输出 JSON 文件', default: false },
         { name: 'csv',  type: 'boolean', description: '输出 CSV 文件',  default: false },
         { name: 'out',  type: 'string',  description: '输出目录',       default: './reports' },
+        { name: 'prevhash-file', type: 'string', description: 'prev_hash 时序 NDJSON（默认与 --file 同目录的 pool-prevhash.ndjson）' },
     ]
 };
 
@@ -185,6 +186,8 @@ function loadRecords(filePath) {
             pool_signature: e.pool_signature ?? null,
             nbits: e.nbits ?? null,
             difficulty: nbits_to_difficulty(e.nbits),
+            hashrate_10min_hs: e.hashrate_10min_hs ?? null,
+            hashrate_total_hs: e.hashrate_total_hs ?? null,
             nonce: e.nonce ?? null,
             version: e.version ?? null,
             job_id: e.job_id ?? null,
@@ -194,6 +197,20 @@ function loadRecords(filePath) {
             header_off_s,
         };
     }).filter(Boolean);
+}
+
+// ============ prev_hash 传播时序加载（pool-prevhash.ndjson，可选）============
+//
+// pool 在每次链 tip 变更时记一行：从 TP 收到新 prev_hash 到向矿机下发 SetNewPrevHash
+// 的延迟 stale_ms（矿机这段时间在旧 prev_hash 上挖无效工作）。文件不存在则返回空。
+function loadPrevhashRecords(filePath) {
+    try {
+        if (!filePath || !fs.existsSync(filePath)) return [];
+        const raw = fs.readFileSync(filePath, 'utf8');
+        return raw.split('\n').filter(l => l.trim()).map(l => {
+            try { return JSON.parse(l); } catch { return null; }
+        }).filter(Boolean);
+    } catch { return []; }
 }
 
 // ============ 多解检测 + 胜出解判定 ============
@@ -326,6 +343,10 @@ function analyzePoolSolutions(config = {}) {
         const fs2 = analyze(findings);
         console.log(`   找块时间(submit−e2): 均值 ${fs2.mean.toFixed(1)}s | 中位 ${fs2.median.toFixed(1)}s | min ${fs2.min.toFixed(1)}s | max ${fs2.max.toFixed(1)}s`);
     }
+    const hrRec = [...chain].reverse().find(c => c.hashrate_10min_hs != null);
+    if (hrRec) {
+        console.log(`   实测算力(最新出块): 10分钟 ${(hrRec.hashrate_10min_hs / 1e12).toFixed(2)} TH/s | 累计 ${(hrRec.hashrate_total_hs / 1e12).toFixed(2)} TH/s`);
+    }
     console.log('');
     printTable(chain);
 
@@ -364,7 +385,13 @@ function analyzePoolSolutions(config = {}) {
         console.log(`📄 CSV : ${p}`);
     }
     if (config.html) {
-        const p = buildHTML(records, chain, byHeight, stats, mu, dev, outDir);
+        const prevhashPath = config.prevhashFile
+            || path.join(path.dirname(filePath), 'pool-prevhash.ndjson');
+        const prevhashRecs = loadPrevhashRecords(prevhashPath);
+        if (prevhashRecs.length) {
+            console.log(`   prev_hash 传播记录: ${prevhashRecs.length} 条 (${prevhashPath})`);
+        }
+        const p = buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRecs);
         console.log(`\n📄 HTML 报告: ${p}`);
     }
 
@@ -437,7 +464,7 @@ function toCSV(records) {
 
 // ============ HTML 报告 ============
 
-function buildHTML(records, chain, byHeight, stats, mu, dev, outDir) {
+function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRecs) {
     const builder = new HTMLChartBuilder();
 
     // ---- 图1 难度变化图（折线连接 + 小点；Y 轴缩放到数据范围放大波动；隐藏 Y 轴数字，悬停看精确值）----
@@ -476,6 +503,45 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir) {
                     : d.interval < mu * 1.2 ? '#3498db'
                     : d.interval < mu * 2.0 ? '#f39c12' : '#e74c3c',
             }
+        );
+    }
+
+    // ---- 图: 实测网络算力（pool 基于 share 统计，10分钟滑窗 + 全程累计）----
+    const hrPts = chain.filter(c => c.hashrate_10min_hs != null || c.hashrate_total_hs != null);
+    if (hrPts.length) {
+        builder.addMultiLineChart(
+            hrPts.map(c => `#${c.block_height}`),
+            [
+                { label: '10分钟滑窗算力 (TH/s)', data: hrPts.map(c => c.hashrate_10min_hs != null ? +(c.hashrate_10min_hs / 1e12).toFixed(3) : null), color: '#16a085' },
+                { label: '全程累计算力 (TH/s)',  data: hrPts.map(c => c.hashrate_total_hs != null ? +(c.hashrate_total_hs / 1e12).toFixed(3) : null), color: '#9b59b6', dash: [5, 3] },
+            ],
+            { title: '实测网络算力（pool 基于 share 统计 · 金标准）', xLabel: '区块高度', yLabel: '算力 (TH/s)',
+              caption: '由 pool 收到的<b>每个被接受 share</b> 还原（H = Σ每share功 / 时间），'
+                     + '<b>直接反映真实算力，与出块间隔无关</b>。'
+                     + '<span style="color:#16a085"><b>绿线 = 10 分钟滑窗</b></span>（近期算力）、'
+                     + '<span style="color:#9b59b6"><b>紫虚线 = 全程累计</b></span>（长期均值）。'
+                     + '<br><b>读法</b>：恒定算力应是一条基本水平的线。与上方“出块间隔”对照——'
+                     + '若某<b>长块</b>处算力<b>仍水平</b>，则该长块<b>不是掉算力</b>（属真随机长尾或 stale prev-hash）；'
+                     + '只有算力出现<b>持续性台阶下降</b>才是真的掉算力。'
+                     + '（仅出块时刻采样，约每 10 分钟一点；旧版 pool 记录无此字段会留空。）' }
+        );
+    }
+
+    // ---- 图: prev_hash 传播延迟 stale_ms（来自 pool-prevhash.ndjson，可选）----
+    if (prevhashRecs && prevhashRecs.length) {
+        const fmtT = (ms) => {
+            const d = new Date(ms);
+            return `${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+        };
+        builder.addLineChart(
+            prevhashRecs.map(r => fmtT(r.tp_recv_ms)),
+            prevhashRecs.map(r => r.stale_ms),
+            { title: 'prev_hash 传播延迟 stale_ms（矿机在旧 prev_hash 上的无效工作窗口）',
+              xLabel: '时间', yLabel: '毫秒', label: 'stale_ms', pointRadius: 2, beginAtZero: true,
+              caption: '每次链 tip 变更：从 pool 收到新 prev_hash 到把 SetNewPrevHash 发给矿机的延迟。'
+                     + '出块限速关闭（job_dispatch_min_interval_secs=0）时应只有<b>几毫秒</b>（纯传播延迟）；'
+                     + '若出现<b>几百~几千毫秒的尖峰</b>，说明矿机这段时间在旧 prev_hash 上挖无效工作 → '
+                     + '这正是“长块”的一个<b>真实成因</b>（模板源慢 / 出块限速 / stash-dedup 逻辑问题）。' }
         );
     }
 
@@ -626,6 +692,7 @@ function parseArgs() {
         switch (args[i]) {
             case '--file': case '-f': config.file = args[++i]; break;
             case '--out':             config.out  = args[++i]; break;
+            case '--prevhash-file':   config.prevhashFile = args[++i]; break;
             case '--html':            config.html = true;      break;
             case '--json':            config.json = true;      break;
             case '--csv':             config.csv  = true;      break;
