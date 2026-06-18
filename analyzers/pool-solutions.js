@@ -47,6 +47,8 @@ const ANALYZER_INFO = {
         { name: 'csv',  type: 'boolean', description: '输出 CSV 文件',  default: false },
         { name: 'out',  type: 'string',  description: '输出目录',       default: './reports' },
         { name: 'prevhash-file', type: 'string', description: 'prev_hash 时序 NDJSON（默认与 --file 同目录的 pool-prevhash.ndjson）' },
+        { name: 'poisson-window', type: 'number', description: '泊松计数图的窗口秒数（默认 3600=每小时出块数）' },
+        { name: 'cross-pool', type: 'boolean', description: '显示基于 share 的算力图（"实测网络算力" + "跨池总算力"）；默认隐藏（share 法受 translator vardiff 影响偏低，算力以出块速率反推为准）', default: false },
     ]
 };
 
@@ -408,14 +410,16 @@ function analyzePoolSolutions(config = {}) {
     const outDir = config.out || './reports';
     if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
     const stamp = Date.now();
+    const heightsAll = [...byHeight.keys()].filter(h => h != null);
+    const fileRange = heightsAll.length ? `${Math.min(...heightsAll)}_${Math.max(...heightsAll)}_` : '';
 
     if (config.json) {
-        const p = path.join(outDir, `pool-solutions_${stamp}.json`);
+        const p = path.join(outDir, `pool-solutions_${fileRange}${stamp}.json`);
         fs.writeFileSync(p, JSON.stringify(records, null, 2));
         console.log(`\n📄 JSON: ${p}`);
     }
     if (config.csv) {
-        const p = path.join(outDir, `pool-solutions_${stamp}.csv`);
+        const p = path.join(outDir, `pool-solutions_${fileRange}${stamp}.csv`);
         fs.writeFileSync(p, toCSV(records));
         console.log(`📄 CSV : ${p}`);
     }
@@ -427,7 +431,8 @@ function analyzePoolSolutions(config = {}) {
             console.log(`   prev_hash 传播记录: ${prevhashRecs.length} 条 (${prevhashPath})`);
         }
         const p = buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRecs,
-            { orphans, competitionHeights, interrupted, pools });
+            { orphans, competitionHeights, interrupted, pools,
+              poissonWindowSec: config.poissonWindow || 3600, showCrossPool: !!config.crossPool });
         console.log(`\n📄 HTML 报告: ${p}`);
     }
 
@@ -500,8 +505,46 @@ function toCSV(records) {
 
 // ============ HTML 报告 ============
 
+// ============ 泊松计数视图（固定时间窗内出几个块；间隔指数图的对偶）============
+//
+// 固定窗口 W 内的出块数 k，在理想泊松过程下服从 PMF: P(X=k)=(λW)^k·e^(−λW)/k!。
+// 把 canonical 链的区块时间按 W 切片计数。为避免把停机/数据缺口期算成 0 块窗口，
+// 先按"大缺口"把时间轴切成连续段，只在段内铺窗口。
+function buildPoissonView(chain, windowSec) {
+    const times = chain.filter(c => c.pool_submit_ms != null)
+        .map(c => c.pool_submit_ms).sort((a, b) => a - b);
+    if (times.length < 5) return null;
+    const W = windowSec * 1000;
+    const GAP = Math.max(W * 3, 3600 * 1000); // 大缺口: 超过视为停机, 不跨段铺窗
+    const counts = [];
+    let seg = [times[0]];
+    const flush = () => {
+        if (seg.length < 2) return;
+        const t0 = seg[0], span = seg[seg.length - 1] - t0;
+        const nW = Math.floor(span / W);
+        if (nW < 1) return;
+        const c = new Array(nW).fill(0);
+        for (const t of seg) { const i = Math.floor((t - t0) / W); if (i >= 0 && i < nW) c[i]++; }
+        counts.push(...c);
+    };
+    for (let i = 1; i < times.length; i++) {
+        if (times[i] - times[i - 1] > GAP) { flush(); seg = []; }
+        seg.push(times[i]);
+    }
+    flush();
+    if (counts.length < 1) return null;
+    const maxK = Math.max(...counts);
+    const hist = new Array(maxK + 1).fill(0);
+    for (const c of counts) hist[c]++;
+    const meanCount = counts.reduce((a, b) => a + b, 0) / counts.length;
+    const variance = counts.reduce((a, b) => a + (b - meanCount) * (b - meanCount), 0) / counts.length;
+    const dispersion = meanCount > 0 ? variance / meanCount : 0; // 泊松=1
+    return { hist, numWindows: counts.length, maxK, meanCount, dispersion };
+}
+
 function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRecs, view = {}) {
-    const { orphans = [], competitionHeights = [], interrupted = null, pools = new Set() } = view;
+    const { orphans = [], competitionHeights = [], interrupted = null, pools = new Set(),
+            poissonWindowSec = 3600, showCrossPool = false } = view;
     const builder = new HTMLChartBuilder();
 
     // ---- 图1 难度变化图（折线连接 + 小点；Y 轴缩放到数据范围放大波动；隐藏 Y 轴数字，悬停看精确值）----
@@ -546,7 +589,7 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
     // ---- 图: 实测网络算力（pool 基于 share 统计，10分钟滑窗 + 全程累计）----
     // 用完整 canonical 链做 X 轴，缺字段的块置 null 且 spanGaps:false →
     // 旧记录(无算力字段)所在高度显示为**断口**，既不隐藏缺口、也不跨空连线。
-    if (chain.some(c => c.hashrate_10min_hs != null || c.hashrate_total_hs != null)) {
+    if (showCrossPool && chain.some(c => c.hashrate_10min_hs != null || c.hashrate_total_hs != null)) {
         builder.addMultiLineChart(
             chain.map(c => `#${c.block_height}`),
             [
@@ -566,7 +609,7 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
     }
 
     // ---- 图: 跨池总算力（仅检测到多个 pool_signature 时显示）----
-    if (pools.size >= 2) {
+    if (showCrossPool && pools.size >= 2) {
         const hrRecs = records
             .filter(r => r.hashrate_10min_hs != null && r.pool_submit_ms != null && r.pool_signature != null)
             .sort((a, b) => a.pool_submit_ms - b.pool_submit_ms);
@@ -683,7 +726,7 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
         });
     }
 
-    // ---- 与 BTC 泊松出块的偏离量化 ----
+    // ---- 与 BTC 泊松出块的偏离量化（紧跟图4 间隔分布：间隔视角的判定）----
     if (dev) {
         const ksVerdict = dev.ksBtc > dev.ksCrit
             ? `<strong style="color:#e74c3c">D &gt; 临界值 → 与 BTC 指数分布显著不同</strong>`
@@ -705,10 +748,69 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
                 <tr><td>KS 距离 vs 自身 Exp(1/μ)</td><td>${dev.ksSelf.toFixed(3)}</td><td>纯形状偏离：是否为泊松过程（越小越像）</td></tr>
             </table>
             <p style="font-size:13px;color:#666;">
-                读图：图4 紫色虚线是 <strong>BTC 泊松参考（λ=1/600）</strong>，红色实线是<strong>本链自身指数拟合（λ=1/μ）</strong>。
+                读图：上图(出块间隔分布)紫色虚线是 <strong>BTC 泊松参考（λ=1/600）</strong>，红色实线是<strong>本链自身指数拟合（λ=1/μ）</strong>。
                 若柱状图贴合红线但远离紫线 → 形状是健康泊松、只是节奏与 BTC 不同（μ≠600）；
                 若柱状图连红线都不贴 → 出块过程本身非泊松（CV、KS_自身会同步偏大）。
             </p>`);
+    }
+
+    // ---- 图 + 判定: 泊松计数分布（每窗出块数 k；间隔指数图的对偶视角）----
+    {
+        const pv = buildPoissonView(chain, poissonWindowSec);
+        if (pv && pv.numWindows >= 3 && mu > 0) {
+            const fact = (k) => { let f = 1; for (let i = 2; i <= k; i++) f *= i; return f; };
+            const pmf = (k, m) => Math.pow(m, k) * Math.exp(-m) / fact(k);
+            const meanMeas = poissonWindowSec / mu;   // λW 实测 = W/μ
+            const meanBtc = poissonWindowSec / 600;    // λW BTC  = W/600
+            const kMax = Math.max(pv.maxK + 2, Math.ceil(meanBtc * 1.5) + 1);
+            const labels = [], counts = [], colors = [], measCurve = [], btcCurve = [];
+            for (let k = 0; k <= kMax; k++) {
+                labels.push(String(k));
+                counts.push(pv.hist[k] || 0);
+                colors.push('#3498db');
+                measCurve.push(+(pv.numWindows * pmf(k, meanMeas)).toFixed(2));
+                btcCurve.push(+(pv.numWindows * pmf(k, meanBtc)).toFixed(2));
+            }
+            const wm = (poissonWindowSec % 3600 === 0) ? `${poissonWindowSec / 3600} 小时`
+                     : (poissonWindowSec % 60 === 0 ? `${poissonWindowSec / 60} 分钟` : `${poissonWindowSec}s`);
+            const band = 2 * Math.sqrt(2 / Math.max(pv.numWindows - 1, 1));
+            const D = pv.dispersion;
+            const dOk = Math.abs(D - 1) <= band;
+            const verdict = dOk ? '✅ 符合泊松(D≈1)'
+                          : (D < 1 ? '❌ 过于规整(D<1,出块比泊松更均匀→疑节流/调控)'
+                                   : '❌ 过度聚集(D>1,比泊松更扎堆)');
+            builder.addBarChart(labels, counts, {
+                title: `每${wm}出块数分布 · 离散指数 D=${D.toFixed(2)} ${verdict}`,
+                xLabel: '窗口内出块数 k（一个窗口里出了几个块）', yLabel: '窗口数（有多少个这样的窗口）',
+                colors,
+                normalCurve: measCurve, normalCurveLabel: `实测泊松 均值${meanMeas.toFixed(2)} 块/窗 (=W/μ)`,
+                normalCurve2: btcCurve, normalCurve2Label: `BTC 泊松 均值${meanBtc.toFixed(2)} 块/窗`,
+                totalCount: pv.numWindows,
+                caption: `横轴 k = 一个 ${wm} 窗口内的出块数；纵轴 = 有多少个这样的窗口（柱=实测，线=理论泊松期望）。公式、本数据参数与正常判据见下方注释表。`,
+            });
+            builder.addNote(`
+                <h3>出块计数泊松检验（上图：每${wm}出块数分布）</h3>
+                <p>把时间轴切成 ${wm} 的固定窗口（共 <b>${pv.numWindows}</b> 个，已按大缺口剔除停机期），数每个窗口出了几个块 k。
+                   理想泊松过程下 k 服从
+                   <span style="font-family:monospace;background:#eef;padding:2px 8px;border-radius:4px;">P(X=k) = (λW)<sup>k</sup>·e<sup>−λW</sup> / k!</span>
+                   （λ=出块速率，W=窗口长度，λW=每窗平均出块数）。曲线值 = 窗口数 × P(X=k)。下表按<strong>本数据实测</strong>列出：</p>
+                <table>
+                    <tr><th>项</th><th>数值（本数据）</th><th>含义 / 判读</th></tr>
+                    <tr><td>窗口长度 W</td><td>${wm}（${poissonWindowSec}s）</td><td>每个计数窗口的时长（--poisson-window 可调）</td></tr>
+                    <tr><td>窗口个数 N</td><td>${pv.numWindows}</td><td>样本量；越多柱子越平滑可信</td></tr>
+                    <tr><td>实测 λW（红线均值）</td><td>${meanMeas.toFixed(2)} 块/窗</td><td>= W/μ（μ=${mu.toFixed(0)}s），本链每窗平均出块</td></tr>
+                    <tr><td>BTC λW（紫虚线均值）</td><td>${meanBtc.toFixed(2)} 块/窗</td><td>= W/600，BTC 参考节奏</td></tr>
+                    <tr><td>离散指数 D = σ²/均值</td><td><b>${D.toFixed(3)}</b></td><td>泊松理论值 = 1.00 —— <strong>判正常与否的核心指标</strong></td></tr>
+                    <tr><td>95% 容许带</td><td>[${(1 - band).toFixed(2)}, ${(1 + band).toFixed(2)}]</td><td>1 ± 2√(2/(N−1))；D 落带内即正常</td></tr>
+                    <tr><td><strong>判定</strong></td><td><strong style="color:${dOk ? '#27ae60' : '#e74c3c'}">${verdict}</strong></td><td>D 在带内 → 符合泊松；偏出 → 异常</td></tr>
+                </table>
+                <p style="font-size:13px;color:#666;">
+                    <b>怎么读</b>：不必肉眼比对每根柱——柱子是计数，天然有 ±√值 的随机抖动（个别柱比曲线高/低 1~2σ 都属正常）。
+                    <b>只看 D 与判定</b>：D≈1 且在带内 = 出块数服从泊松（健康；与"间隔服从指数"是同一过程的两种视角，应同时为 ✅）；
+                    D&lt;1 = 过于规整（疑节流/调控），D&gt;1 = 过度扎堆。本表是<strong>计数视角</strong>，与上方"偏离量化"表的<strong>间隔视角</strong>互为对偶。
+                </p>
+                <p style="font-size:13px;color:#888;">单位提醒：本图均值是<b>块/窗</b>（每窗出几个块），间隔图/偏离表的 μ 是<b>秒/块</b>，二者互为倒数 <b>均值 = W / μ</b>。间隔越短 ⟺ 每窗出块越多，两数方向相反是必然，<b>不矛盾</b>。</p>`);
+        }
     }
 
     // ---- canonical 链重建说明（去重 + 反向溯链 + 排除分叉 + 中断标记）----
@@ -746,30 +848,19 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
             <tr><td>找块时间异常</td><td>submit−e2 &lt; 0</td><td>上块时间早于开挖时间 → 时钟回拨或 e2 编码错误</td></tr>
             <tr><td>时间源不一致</td><td>|header−e2| &gt; 120s</td><td>区块头 nTime 与 extranonce2 起挖时间偏离过大</td></tr>
         </table>
-        <p>统计：高度 ${byHeight.size} 个，多解竞争 ${multiCount} 处，命中异常 ${anomalyCount} 条。</p>
-        <h3>三时间源说明（图3 读法）</h3>
-        <p>每个解涉及三个时间：<strong>pool_submit_time</strong>（pool 收到并验证解的墙钟时刻，毫秒）、
-           <strong>utc_e2</strong>（矿机编码进 extranonce2 的开挖时刻，毫秒）、
-           <strong>header_timestamp</strong>（区块头 nTime，<strong>整秒</strong>）。
-           三者本应描述<strong>同一个出块时刻</strong>，差异只在秒级，故同绘于一根"秒"轴上：</p>
-        <ul>
-            <li><strong style="color:#3498db">蓝线 找块耗时 submit−e2</strong>：从开挖到 pool 接受解的耗时，应为正、数秒量级；
-                出现明显负值才是"找块时间异常"（时钟回拨 / e2 编码错误）。</li>
-            <li><strong style="color:#e74c3c">红虚线 header−e2 偏移</strong>：区块头 nTime 与开挖时刻之差，应贴近 0。
-                <strong>计算口径</strong>：header 只有整秒精度，因此把 e2 也截断到整秒再相减（<code>header − floor(e2)</code>），
-                得到的是整数秒偏移，<strong>不会出现毫秒级假负值</strong>。只有持续偏离到几十秒以上才说明时间源构造有问题。</li>
-        </ul>
-        <p style="color:#888;font-size:12px;">※ 两条线量纲相同，可直接比较高低；阈值见上表"时间源不一致 |header−e2|&gt;120s"。</p>
+        <p>统计：高度 ${byHeight.size} 个，多解竞争 ${multiCount} 处，命中异常 ${anomalyCount} 条。
+           （三时间源 submit−e2 / header−e2 的读法见上方"时间源一致性"图的说明。）</p>
         <p style="color:#888;font-size:12px;">※ 公式与阈值为起步基线，确定正式判据后可在 flagAnomalies() 中调整。</p>
     `);
 
-    // 标题附带高度范围，如「Pool 出块记录分析报告 (836261-836370)」
+    // 标题/文件名附带高度范围，如「Pool 出块记录分析报告 (836261-836370)」
     const heights = [...byHeight.keys()].filter(h => h != null);
     const titleRange = heights.length ? ` (${Math.min(...heights)}-${Math.max(...heights)})` : '';
+    const fileRange = heights.length ? `${Math.min(...heights)}_${Math.max(...heights)}_` : '';
 
     return builder
         .setTitle(`${ANALYZER_INFO.name}报告${titleRange}`)
-        .save(`pool-solutions_${Date.now()}.html`, outDir);
+        .save(`pool-solutions_${fileRange}${Date.now()}.html`, outDir);
 }
 
 // ============ 命令行 ============
@@ -781,6 +872,8 @@ function parseArgs() {
             case '--file': case '-f': config.file = args[++i]; break;
             case '--out':             config.out  = args[++i]; break;
             case '--prevhash-file':   config.prevhashFile = args[++i]; break;
+            case '--poisson-window':  config.poissonWindow = parseInt(args[++i], 10); break;
+            case '--cross-pool':      config.crossPool = true; break;
             case '--html':            config.html = true;      break;
             case '--json':            config.json = true;      break;
             case '--csv':             config.csv  = true;      break;
