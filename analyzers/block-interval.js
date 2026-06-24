@@ -29,7 +29,9 @@ const ANALYZER_INFO = {
         { name: 'end', alias: 'e', type: 'number', description: '结束区块高度', default: null },
         { name: 'html', type: 'boolean', description: '生成 HTML 报告', default: false },
         { name: 'chart', type: 'boolean', description: '显示 ASCII 图表', default: false },
-        { name: 'linear', type: 'boolean', description: '使用线性归一化（默认开平方）', default: false }
+        { name: 'linear', type: 'boolean', description: '使用线性归一化（默认开平方）', default: false },
+        { name: 'include-gaps', type: 'boolean', description: '把大缺口(停机/断链)也计入泊松计数 D（默认剔除，仅统计在线期；开启后所有异常数据进入计算）', default: false },
+        { name: 'gap-threshold', type: 'number', description: '大缺口阈值秒数，超过即判为停机/断链（默认 max(窗口×3, 3600)=10800s）', default: null }
     ]
 };
 
@@ -66,14 +68,18 @@ function normalizeIntervals(intervals, useSqrt = false) {
 
 /**
  * 泊松计数视图：把区块时间(秒)按固定窗口 W 切片，数每窗出块数 k。
- * 理想泊松过程下 k 服从 P(X=k)=(λW)^k·e^(−λW)/k!。按大缺口分段，避免把停机期算成 0 块窗口。
+ * 理想泊松过程下 k 服从 P(X=k)=(λW)^k·e^(−λW)/k!。
+ * opts.excludeGaps=true（默认）时按大缺口分段，避免把停机期算成 0 块窗口（D 仅反映在线期）；
+ *   excludeGaps=false 则把整条时间轴铺满窗口，停机期作为 0 块窗口计入 → D 会因停机而偏大（如实反映异常）。
+ * opts.gapThreshold 自定义大缺口阈值（秒），默认 max(W×3, 3600)。
  * 返回 {hist, numWindows, maxK, meanCount, dispersion}（dispersion=方差/均值，泊松=1）。
  */
-function buildPoissonCounts(timesSec, windowSec) {
+function buildPoissonCounts(timesSec, windowSec, opts = {}) {
+    const { excludeGaps = true, gapThreshold } = opts;
     const times = [...timesSec].sort((a, b) => a - b);
     if (times.length < 5) return null;
     const W = windowSec;
-    const GAP = Math.max(W * 3, 3600);
+    const GAP = excludeGaps ? (gapThreshold || Math.max(W * 3, 3600)) : Infinity;
     const counts = [];
     let seg = [times[0]];
     const flush = () => {
@@ -97,6 +103,23 @@ function buildPoissonCounts(timesSec, windowSec) {
     const meanCount = counts.reduce((a, b) => a + b, 0) / counts.length;
     const variance = counts.reduce((a, b) => a + (b - meanCount) ** 2, 0) / counts.length;
     return { hist, numWindows: counts.length, maxK, meanCount, dispersion: meanCount > 0 ? variance / meanCount : 0 };
+}
+
+/**
+ * 缺口 / 停机汇总：找出相邻区块时间差 > gapThreshold 的所有"大缺口"（停机/断链/数据缺失）。
+ * 这些正是泊松计数 excludeGaps 模式下会剔除的窗口，单列出来使"剔除"可见，并作为与 D 解耦的 outage 判据。
+ * 返回 { gaps:[{start,end,duration}], count, total, longest }（单位与输入一致）。
+ */
+function summarizeGaps(timesSec, gapThreshold) {
+    const times = [...timesSec].sort((a, b) => a - b);
+    const gaps = [];
+    for (let i = 1; i < times.length; i++) {
+        const d = times[i] - times[i - 1];
+        if (d > gapThreshold) gaps.push({ start: times[i - 1], end: times[i], duration: d });
+    }
+    const total = gaps.reduce((a, g) => a + g.duration, 0);
+    const longest = gaps.reduce((m, g) => Math.max(m, g.duration), 0);
+    return { gaps, count: gaps.length, total, longest };
 }
 
 /**
@@ -324,67 +347,77 @@ async function analyzeBlockInterval(config = {}) {
             }
         );
 
-        // 分布直方图（含实测指数拟合 λ=1/μ + BTC 泊松参考 λ=1/600 对比）
-        const validIntervalVals = validIntervalValues;
-        // Freedman-Diaconis 规则：h = 2 × IQR × N^(-1/3)，对极端值鲁棒
-        const sortedVals = [...validIntervalVals].sort((a, b) => a - b);
-        const q1 = sortedVals[Math.floor(sortedVals.length * 0.25)];
-        const q3 = sortedVals[Math.floor(sortedVals.length * 0.75)];
-        const iqr = q3 - q1;
-        const fdWidth = 2 * iqr * Math.pow(validIntervalVals.length, -1 / 3);
-        const mainBinWidth = Math.max(5, Math.round(fdWidth));
-        const numMainBins = Math.ceil(intervalStats.p99 / mainBinWidth);
-        const outlierMin = numMainBins * mainBinWidth;
+        // 出块间隔概率分布（实测 vs BTC 理论对比）—— 线性时间轴 + 概率密度，曲线下面积=出块概率
+        // BTC 出块目标 600s，间隔服从指数分布 Exp(λ=1/600)。
+        const BTC_TARGET_S = 600;
+        const validIv = validIntervalValues;
+        if (validIv.length >= 2) {
+            // Freedman-Diaconis 规则：h = 2 × IQR × N^(-1/3)，对极端值鲁棒
+            const sorted = [...validIv].sort((a, b) => a - b);
+            const q1 = sorted[Math.floor(sorted.length * 0.25)];
+            const q3 = sorted[Math.floor(sorted.length * 0.75)];
+            const iqr = q3 - q1;
+            const fdWidth = 2 * iqr * Math.pow(validIv.length, -1 / 3);
+            const binWidth = Math.max(5, Math.round(fdWidth || 5));
+            const numBins = Math.max(1, Math.ceil((intervalStats.p99 || intervalStats.max) / binWidth));
+            const outlierMin = numBins * binWidth;
 
-        const fineBinLabels = [];
-        const fineBinCounts = [];
-        const fineBinColors = [];
-        const selfExpCurveData = [];
-        const binRanges = [];
-
-        // 比特币理论指数分布：λ=1/600（泊松出块过程）
-        const BTC_LAMBDA = 1 / 600;
-        const theoreticalCurveData = [];
-
-        for (let i = 0; i < numMainBins; i++) {
-            const binMin = i * mainBinWidth;
-            const binMax = (i + 1) * mainBinWidth;
-            const binCenter = binMin + mainBinWidth / 2;
-            const count = validIntervalVals.filter(v => v >= binMin && v < binMax).length;
-            fineBinLabels.push(i % 5 === 0 ? `${binMin}s` : '');
-            fineBinCounts.push(count);
-            fineBinColors.push(binCenter < 60 ? '#27ae60' : binCenter < 300 ? '#3498db' : '#e74c3c');
-            binRanges.push({ min: binMin, max: binMax });
-            // 实测指数拟合 λ=1/μ（出块间隔服从指数分布，而非正态；旧的高斯拟合不适用，已删除）
-            const pdfSelf = mu > 0 ? (1 / mu) * Math.exp(-binCenter / mu) : 0;
-            selfExpCurveData.push(parseFloat((pdfSelf * validIntervalVals.length * mainBinWidth).toFixed(2)));
-            const pdfBtc = BTC_LAMBDA * Math.exp(-BTC_LAMBDA * binCenter);
-            theoreticalCurveData.push(parseFloat((pdfBtc * validIntervalVals.length * mainBinWidth).toFixed(2)));
-        }
-        const outlierCount = validIntervalVals.filter(v => v >= outlierMin).length;
-        if (outlierCount > 0) {
-            fineBinLabels.push(`>${outlierMin}s`);
-            fineBinCounts.push(outlierCount);
-            fineBinColors.push('#e74c3c');
-            selfExpCurveData.push(0);
-            theoreticalCurveData.push(0);
-            binRanges.push({ min: outlierMin, max: Infinity });
-        }
-
-        builder.addBarChart(
-            fineBinLabels,
-            fineBinCounts,
-            {
-                title: '出块间隔分布（实测指数拟合 λ=1/μ vs BTC 泊松参考 λ=1/600）',
-                xLabel: '时间间隔',
-                yLabel: '频次',
-                colors: fineBinColors,
-                normalCurve: selfExpCurveData, normalCurveLabel: `实测指数拟合 λ=1/μ (μ=${mu.toFixed(0)}s)`,
-                normalCurve2: theoreticalCurveData, normalCurve2Label: 'BTC 泊松参考 λ=1/600',
-                binRanges,
-                totalCount: validIntervalVals.length
+            // 各 bin 频次（闭箱）+ 末尾 >outlier 开箱
+            const counts = [];
+            for (let i = 0; i < numBins; i++) {
+                const bMin = i * binWidth, bMax = (i + 1) * binWidth;
+                counts.push(validIv.filter(v => v >= bMin && v < bMax).length);
             }
-        );
+            const outlierCount = validIv.filter(v => v >= outlierMin).length;
+            if (outlierCount > 0) counts.push(outlierCount);
+
+            // 四个不重叠区间(分割点 1/10/30 分钟)的出块概率：实测从原始间隔精确统计，BTC 用 CDF
+            const N = validIv.length;
+            const lamB = 1 / BTC_TARGET_S;
+            const empCnt = (a, b) => validIv.filter(v => v >= a && v < b).length / N; // 实测 P(a≤T<b)
+            const Pexp = (a, b, lam) => Math.exp(-lam * a) - Math.exp(-lam * b);      // 理论 P(a<T<b)
+            const pc = v => (v * 100).toFixed(1) + '%';
+            // 轴从 0 起，四个不重叠区间：<1m / 1–10m / 10–30m / >30m，各标自身出块概率
+            const regions = [
+                { name: '快块 <1m',  x0: 0,  x1: 1,  emp: empCnt(0, 60),         btc: Pexp(0, 60, lamB),         fill: 'rgba(39,174,96,0.10)',  line: '#27ae60' },
+                { name: '1–10m',     x0: 1,  x1: 10, emp: empCnt(60, 600),        btc: Pexp(60, 600, lamB),       fill: 'rgba(41,128,185,0.09)', line: '#2980b9' },
+                { name: '10–30m',    x0: 10, x1: 30, emp: empCnt(600, 1800),      btc: Pexp(600, 1800, lamB),     fill: 'rgba(243,156,18,0.10)', line: '#e67e22' },
+                { name: '长块 >30m', x0: 30, x1: 45, emp: empCnt(1800, Infinity), btc: Pexp(1800, Infinity, lamB), fill: 'rgba(231,76,60,0.10)',  line: '#e74c3c' },
+            ];
+            // <1min 细分（注释用）—— 直接数整数计数，避免占比×N 的浮点误差
+            const cntIv = (a, b) => validIv.filter(v => v >= a && v < b).length;
+            const sub1 = cntIv(0, 60), minIv = Math.min(...validIv);
+            const sub1Note = `<br><b>间隔 &lt;1min 细分</b>：共 <b>${sub1}</b> 个（${pc(sub1 / N)}）；`
+                + `&lt;10s ${cntIv(0, 10)} 个、10–30s ${cntIv(10, 30)} 个、30–60s ${cntIv(30, 60)} 个；最短间隔 ${minIv.toFixed(0)}s。`;
+            // 累计概率(用户口径)：P(<m分钟)
+            const cumEmp = m => validIv.filter(v => v < m * 60).length / N;
+            // ≤0 间隔(同刻/乱序)出块的实测核查（validIv 已滤 >0，这里从未过滤的 intervalValues 数）
+            const zeroNeg = intervalValues.filter(v => v != null && v <= 0).length;
+            // 图内左上角注：≤0 间隔的实测说明
+            const cornerNotes = [
+                { text: zeroNeg > 0 ? `⚠ 间隔≤0(同刻/乱序)的块：${zeroNeg} 个` : `实测无间隔≤0的块（最短 ${minIv.toFixed(0)}s）`, color: '#777' },
+            ];
+            const cumLine = `<br><b>累计概率</b>：`
+                + `P(&lt;1m) 实测${pc(cumEmp(1))}/BTC${pc(1 - Math.exp(-60 * lamB))} · `
+                + `P(&lt;10m) 实测${pc(cumEmp(10))}/BTC${pc(1 - Math.exp(-600 * lamB))} · `
+                + `P(&lt;30m) 实测${pc(cumEmp(30))}/BTC${pc(1 - Math.exp(-1800 * lamB))} · `
+                + `P(&gt;30m) 实测${pc(1 - cumEmp(30))}/BTC${pc(Math.exp(-1800 * lamB))}`;
+
+            // 线性时间轴(0~45min)、纵轴概率密度：曲线下某区间面积=该区间出块概率；10min 处粗分割线
+            builder.addProbDistChart({
+                title: '出块间隔概率分布（实测 vs BTC 理论对比）',
+                caption: '横轴=出块间隔(分钟)。<b>蓝色填充曲线=BTC 理论分布，红线=本链实测</b>；红线贴合蓝线 → 本链出块≈比特币理论。'
+                    + '四个区带分别标出 <b>&lt;1m / 1–10m / 10–30m / &gt;30m</b> 各自出块概率(实测 vs BTC 理论，四区相加=100%)；<b>10min 粗线=BTC 目标</b>。'
+                    + sub1Note
+                    + `<br><b>生成公式</b>：密度曲线 <code>f(t)=λ·e<sup>−λt</sup></code>（速率 λ=1/μ：BTC μ=600s，实测 μ=${mu.toFixed(0)}s）；`
+                    + '区间<b>理论</b>概率 <code>P(a≤t&lt;b)=e<sup>−λa</sup>−e<sup>−λb</sup></code>（a、b 单位秒），区间<b>实测</b>概率 = 该区间样本数 ÷ 总数 N。'
+                    + '纵轴是概率<b>密度</b>(1/分钟)非概率，概率=曲线下面积；密度在 t→0 处最高(≈λ)、单调下降，这是无记忆泊松过程的真实形状。'
+                    + cumLine,
+                counts, closedBins: numBins, totalCount: N,
+                binWidth, muSelf: mu, btcTarget: BTC_TARGET_S,
+                xMinM: 0, xMaxM: 45, boldLineMin: 10, dividers: [1, 10, 30], regions, cornerNotes,
+            });
+        }
 
         // 长尾概率说明
         const btcMu = 600;
@@ -397,7 +430,7 @@ async function analyzeBlockInterval(config = {}) {
                ${Math.abs(sigma / mu - 1) < 0.15
                  ? '<strong style="color:#27ae60">≈1 → 形状符合指数分布（健康泊松出块）</strong>'
                  : (sigma / mu > 1 ? '<strong style="color:#e67e22">＞1 → 长尾偏重</strong>' : '<strong style="color:#e67e22">＜1 → 过于规整</strong>')}。
-               上图红色实线 = 本链实测指数拟合(λ=1/μ)，紫色虚线 = BTC 泊松参考(λ=1/600)；柱贴红线即服从指数。</p>
+               上图“出块间隔概率分布”中红线 = 本链实测、蓝色填充曲线 = BTC 理论分布(λ=1/600)；红线贴合蓝线即服从指数。</p>
             <h3>关于指数分布的长尾</h3>
             <p>
                 PoW 出块过程本质是泊松过程：每次 hash 尝试相互独立，成功概率极小。
@@ -427,7 +460,11 @@ async function analyzeBlockInterval(config = {}) {
         `);
 
         // 出块计数泊松分布（每小时出块数；间隔指数图的对偶视角）
-        const pv = buildPoissonCounts(blocks.map(b => b.time), 3600);
+        // 缺口开关：默认剔除大缺口（D 仅反映在线期）；--include-gaps 则全部计入（停机也进 D）。
+        const excludeGaps = config.includeGaps !== true;
+        const gapThreshold = config.gapThreshold || Math.max(3600 * 3, 3600);
+        const gapInfo = summarizeGaps(blocks.map(b => b.time), gapThreshold);
+        const pv = buildPoissonCounts(blocks.map(b => b.time), 3600, { excludeGaps, gapThreshold });
         if (pv && pv.numWindows >= 3 && mu > 0) {
             const fact = (k) => { let f = 1; for (let i = 2; i <= k; i++) f *= i; return f; };
             const pmf = (k, m) => Math.pow(m, k) * Math.exp(-m) / fact(k);
@@ -458,7 +495,7 @@ async function analyzeBlockInterval(config = {}) {
             });
             builder.addNote(`
                 <h3>出块计数泊松检验（上图：每 1 小时出块数分布）</h3>
-                <p>把时间轴切成 1 小时固定窗口（共 <b>${pv.numWindows}</b> 个，已按大缺口剔除停机期），数每窗出几个块 k。
+                <p>把时间轴切成 1 小时固定窗口（共 <b>${pv.numWindows}</b> 个，${excludeGaps ? '已按大缺口<b>剔除</b>停机期' : '<b>含</b>停机期(<code>--include-gaps</code>)'}），数每窗出几个块 k。
                    理想泊松过程下 k 服从
                    <span style="font-family:monospace;background:#eef;padding:2px 8px;border-radius:4px;">P(X=k) = (λW)<sup>k</sup>·e<sup>−λW</sup> / k!</span>，
                    曲线值 = 窗口数 × P(X=k)。下表按<strong>本数据实测</strong>列出：</p>
@@ -474,6 +511,30 @@ async function analyzeBlockInterval(config = {}) {
                 </table>
                 <p style="font-size:13px;color:#666;">不必肉眼比对每根柱——柱子是计数，天然有 ±√值 抖动（个别柱高/低 1~2σ 正常）。<b>只看 D 与判定</b>：与上面"间隔分布(CV)"是同一过程的计数视角 vs 间隔视角，应同时为 ✅。</p>
                 <p style="font-size:13px;color:#888;">单位提醒：本图均值是<b>块/小时</b>（每窗出几个块），间隔图的 μ 是<b>秒/块</b>，二者互为倒数 <b>均值 = 3600 / μ</b>。间隔越短 ⟺ 每小时出块越多，两数方向相反是必然，<b>不矛盾</b>。</p>`);
+        }
+
+        // ---- 缺口 / 停机汇总 + outage 判据（让"剔除"可见，并与离散指数 D 解耦地报告停机）----
+        {
+            const fmtDur = s => s >= 3600 ? `${(s / 3600).toFixed(2)} h` : (s >= 60 ? `${(s / 60).toFixed(1)} min` : `${Math.round(s)} s`);
+            const fmtTs = sec => new Date(sec * 1000).toISOString().replace('T', ' ').replace('.000Z', '');
+            const rows = gapInfo.gaps
+                .slice().sort((a, b) => b.duration - a.duration)
+                .map(g => `<tr><td>${fmtTs(g.start)} → ${fmtTs(g.end)} UTC</td><td>${fmtDur(g.duration)}</td>`
+                    + `<td>≈ 丢失 ${mu > 0 ? Math.round(g.duration / mu) : '?'} 个区块时间（${mu > 0 ? (g.duration / mu).toFixed(0) : '?'}×μ）</td></tr>`)
+                .join('');
+            const outageVerdict = gapInfo.count > 0
+                ? `<strong style="color:#e74c3c">⚠ 检测到 ${gapInfo.count} 次停机/断链</strong>（最长 ${fmtDur(gapInfo.longest)}，累计 ${fmtDur(gapInfo.total)}）`
+                : `<strong style="color:#27ae60">✅ 无大缺口（无超过阈值的停机）</strong>`;
+            const modeTxt = excludeGaps
+                ? '本次为<b>剔除模式</b>（默认）：以下缺口<b>已从泊松计数 D 中剔除</b>，D 仅反映"在线期"出块节奏。要让 D 把停机也算进去，运行时加 <code>--include-gaps</code>。'
+                : '本次为<b>包含模式</b>（<code>--include-gaps</code>）：以下缺口<b>已计入泊松计数</b>，D 会因停机而偏大（过度离散，如实反映异常）。';
+            builder.addNote(`
+                <h3>缺口 / 停机汇总（outage 判据，与离散指数 D 解耦）</h3>
+                <p>大缺口阈值 = <b>${fmtDur(gapThreshold)}</b>（${gapThreshold}s，<code>--gap-threshold</code> 可调）。相邻区块间隔超过该阈值即判为<b>停机 / 断链 / 数据缺失</b>，独立于 D 单独报告——这样泊松计数“剔除了什么”始终可见，不会用一个 ✅ 把真实停机洗白。</p>
+                <p>判定：${outageVerdict}</p>
+                <p style="font-size:13px;color:#666;">${modeTxt}</p>
+                ${gapInfo.count > 0 ? `<table><tr><th>缺口区间 (UTC)</th><th>时长</th><th>影响（相对实测 μ=${mu.toFixed(0)}s）</th></tr>${rows}</table>` : ''}
+            `);
         }
 
         // 保存 HTML
@@ -512,6 +573,12 @@ function parseArgs() {
                 break;
             case '--linear':
                 config.linear = true;
+                break;
+            case '--include-gaps':
+                config.includeGaps = true;
+                break;
+            case '--gap-threshold':
+                config.gapThreshold = parseInt(args[++i], 10);
                 break;
             case '--silent':
                 config.silent = true;

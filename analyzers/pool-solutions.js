@@ -49,6 +49,8 @@ const ANALYZER_INFO = {
         { name: 'prevhash-file', type: 'string', description: 'prev_hash 时序 NDJSON（默认与 --file 同目录的 pool-prevhash.ndjson）' },
         { name: 'poisson-window', type: 'number', description: '泊松计数图的窗口秒数（默认 3600=每小时出块数）' },
         { name: 'cross-pool', type: 'boolean', description: '显示基于 share 的算力图（"实测网络算力" + "跨池总算力"）；默认隐藏（share 法受 translator vardiff 影响偏低，算力以出块速率反推为准）', default: false },
+        { name: 'include-gaps', type: 'boolean', description: '把大缺口(停机/断链)也计入泊松计数 D（默认剔除，仅统计在线期；开启后所有异常数据进入计算）', default: false },
+        { name: 'gap-threshold', type: 'number', description: '大缺口阈值秒数，超过即判为停机/断链（默认 max(窗口×3, 3600)）' },
     ]
 };
 
@@ -432,7 +434,8 @@ function analyzePoolSolutions(config = {}) {
         }
         const p = buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRecs,
             { orphans, competitionHeights, interrupted, pools,
-              poissonWindowSec: config.poissonWindow || 3600, showCrossPool: !!config.crossPool });
+              poissonWindowSec: config.poissonWindow || 3600, showCrossPool: !!config.crossPool,
+              includeGaps: !!config.includeGaps, gapThresholdSec: config.gapThreshold || null });
         console.log(`\n📄 HTML 报告: ${p}`);
     }
 
@@ -508,14 +511,17 @@ function toCSV(records) {
 // ============ 泊松计数视图（固定时间窗内出几个块；间隔指数图的对偶）============
 //
 // 固定窗口 W 内的出块数 k，在理想泊松过程下服从 PMF: P(X=k)=(λW)^k·e^(−λW)/k!。
-// 把 canonical 链的区块时间按 W 切片计数。为避免把停机/数据缺口期算成 0 块窗口，
-// 先按"大缺口"把时间轴切成连续段，只在段内铺窗口。
-function buildPoissonView(chain, windowSec) {
+// 把 canonical 链的区块时间按 W 切片计数。
+// opts.excludeGaps=true（默认）：按"大缺口"把时间轴切成连续段、只在段内铺窗口，避免把停机/数据缺口算成 0 块窗口（D 仅反映在线期）；
+//   excludeGaps=false：整条时间轴铺满窗口，停机期作为 0 块窗口计入 → D 因停机而偏大（如实反映异常）。
+// opts.gapThresholdMs 自定义大缺口阈值（毫秒），默认 max(W×3, 3600000)。
+function buildPoissonView(chain, windowSec, opts = {}) {
+    const { excludeGaps = true, gapThresholdMs } = opts;
     const times = chain.filter(c => c.pool_submit_ms != null)
         .map(c => c.pool_submit_ms).sort((a, b) => a - b);
     if (times.length < 5) return null;
     const W = windowSec * 1000;
-    const GAP = Math.max(W * 3, 3600 * 1000); // 大缺口: 超过视为停机, 不跨段铺窗
+    const GAP = excludeGaps ? (gapThresholdMs || Math.max(W * 3, 3600 * 1000)) : Infinity; // 大缺口: 超过视为停机, 不跨段铺窗
     const counts = [];
     let seg = [times[0]];
     const flush = () => {
@@ -542,9 +548,26 @@ function buildPoissonView(chain, windowSec) {
     return { hist, numWindows: counts.length, maxK, meanCount, dispersion };
 }
 
+// 缺口 / 停机汇总：找出 canonical 链上相邻区块 pool_submit_ms 差 > gapThresholdMs 的所有"大缺口"
+// （停机 / 断链 / 数据缺失）。这些正是泊松计数 excludeGaps 模式下会剔除的窗口，单列出来使"剔除"可见，
+// 并作为与离散指数 D 解耦的 outage 判据。返回 { gaps:[{start,end,duration}](毫秒), count, total, longest }。
+function summarizeGaps(chain, gapThresholdMs) {
+    const times = chain.filter(c => c.pool_submit_ms != null)
+        .map(c => c.pool_submit_ms).sort((a, b) => a - b);
+    const gaps = [];
+    for (let i = 1; i < times.length; i++) {
+        const d = times[i] - times[i - 1];
+        if (d > gapThresholdMs) gaps.push({ start: times[i - 1], end: times[i], duration: d });
+    }
+    const total = gaps.reduce((a, g) => a + g.duration, 0);
+    const longest = gaps.reduce((m, g) => Math.max(m, g.duration), 0);
+    return { gaps, count: gaps.length, total, longest };
+}
+
 function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRecs, view = {}) {
     const { orphans = [], competitionHeights = [], interrupted = null, pools = new Set(),
-            poissonWindowSec = 3600, showCrossPool = false } = view;
+            poissonWindowSec = 3600, showCrossPool = false,
+            includeGaps = false, gapThresholdSec = null } = view;
     const builder = new HTMLChartBuilder();
 
     // ---- 图1 难度变化图（折线连接 + 小点；Y 轴缩放到数据范围放大波动；隐藏 Y 轴数字，悬停看精确值）----
@@ -778,7 +801,11 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
 
     // ---- 图 + 判定: 泊松计数分布（每窗出块数 k；间隔指数图的对偶视角）----
     {
-        const pv = buildPoissonView(chain, poissonWindowSec);
+        // 缺口开关：默认剔除大缺口（D 仅反映在线期）；includeGaps(--include-gaps) 则全部计入（停机也进 D）。
+        const excludeGaps = includeGaps !== true;
+        const gapThresholdMs = (gapThresholdSec ? gapThresholdSec * 1000 : Math.max(poissonWindowSec * 1000 * 3, 3600 * 1000));
+        const gapInfo = summarizeGaps(chain, gapThresholdMs);
+        const pv = buildPoissonView(chain, poissonWindowSec, { excludeGaps, gapThresholdMs });
         if (pv && pv.numWindows >= 3 && mu > 0) {
             const fact = (k) => { let f = 1; for (let i = 2; i <= k; i++) f *= i; return f; };
             const pmf = (k, m) => Math.pow(m, k) * Math.exp(-m) / fact(k);
@@ -812,7 +839,7 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
             });
             builder.addNote(`
                 <h3>出块计数泊松检验（上图：每${wm}出块数分布）</h3>
-                <p>把时间轴切成 ${wm} 的固定窗口（共 <b>${pv.numWindows}</b> 个，已按大缺口剔除停机期），数每个窗口出了几个块 k。
+                <p>把时间轴切成 ${wm} 的固定窗口（共 <b>${pv.numWindows}</b> 个，${excludeGaps ? '已按大缺口<b>剔除</b>停机期' : '<b>含</b>停机期(<code>--include-gaps</code>)'}），数每个窗口出了几个块 k。
                    理想泊松过程下 k 服从
                    <span style="font-family:monospace;background:#eef;padding:2px 8px;border-radius:4px;">P(X=k) = (λW)<sup>k</sup>·e<sup>−λW</sup> / k!</span>
                    （λ=出块速率，W=窗口长度，λW=每窗平均出块数）。曲线值 = 窗口数 × P(X=k)。下表按<strong>本数据实测</strong>列出：</p>
@@ -832,6 +859,31 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
                     D&lt;1 = 过于规整（疑节流/调控），D&gt;1 = 过度扎堆。本表是<strong>计数视角</strong>，与上方"偏离量化"表的<strong>间隔视角</strong>互为对偶。
                 </p>
                 <p style="font-size:13px;color:#888;">单位提醒：本图均值是<b>块/窗</b>（每窗出几个块），间隔图/偏离表的 μ 是<b>秒/块</b>，二者互为倒数 <b>均值 = W / μ</b>。间隔越短 ⟺ 每窗出块越多，两数方向相反是必然，<b>不矛盾</b>。</p>`);
+        }
+
+        // ---- 缺口 / 停机汇总 + outage 判据（让"剔除"可见，并与离散指数 D 解耦地报告停机）----
+        {
+            const fmtDur = ms => ms >= 3600000 ? `${(ms / 3600000).toFixed(2)} h` : (ms >= 60000 ? `${(ms / 60000).toFixed(1)} min` : `${Math.round(ms / 1000)} s`);
+            const fmtTs = ms => new Date(ms).toISOString().replace('T', ' ').replace('.000Z', '');
+            const muMs = mu * 1000;
+            const rows = gapInfo.gaps
+                .slice().sort((a, b) => b.duration - a.duration)
+                .map(g => `<tr><td>${fmtTs(g.start)} → ${fmtTs(g.end)} UTC</td><td>${fmtDur(g.duration)}</td>`
+                    + `<td>≈ 丢失 ${muMs > 0 ? Math.round(g.duration / muMs) : '?'} 个区块时间（${muMs > 0 ? (g.duration / muMs).toFixed(0) : '?'}×μ）</td></tr>`)
+                .join('');
+            const outageVerdict = gapInfo.count > 0
+                ? `<strong style="color:#e74c3c">⚠ 检测到 ${gapInfo.count} 次停机/断链</strong>（最长 ${fmtDur(gapInfo.longest)}，累计 ${fmtDur(gapInfo.total)}）`
+                : `<strong style="color:#27ae60">✅ 无大缺口（无超过阈值的停机）</strong>`;
+            const modeTxt = excludeGaps
+                ? '本次为<b>剔除模式</b>（默认）：以下缺口<b>已从泊松计数 D 中剔除</b>，D 仅反映"在线期"出块节奏。要让 D 把停机也算进去，运行时加 <code>--include-gaps</code>。'
+                : '本次为<b>包含模式</b>（<code>--include-gaps</code>）：以下缺口<b>已计入泊松计数</b>，D 会因停机而偏大（过度离散，如实反映异常）。';
+            builder.addNote(`
+                <h3>缺口 / 停机汇总（outage 判据，与离散指数 D 解耦）</h3>
+                <p>大缺口阈值 = <b>${fmtDur(gapThresholdMs)}</b>（${Math.round(gapThresholdMs / 1000)}s，<code>--gap-threshold</code> 可调，单位秒）。canonical 链上相邻区块 pool_submit_time 超过该阈值即判为<b>停机 / 断链 / 数据缺失</b>，独立于 D 单独报告——这样泊松计数“剔除了什么”始终可见，不会用一个 ✅ 把真实停机洗白。</p>
+                <p>判定：${outageVerdict}</p>
+                <p style="font-size:13px;color:#666;">${modeTxt}</p>
+                ${gapInfo.count > 0 ? `<table><tr><th>缺口区间 (UTC)</th><th>时长</th><th>影响（相对实测 μ=${mu.toFixed(0)}s）</th></tr>${rows}</table>` : ''}
+            `);
         }
     }
 
@@ -896,6 +948,8 @@ function parseArgs() {
             case '--prevhash-file':   config.prevhashFile = args[++i]; break;
             case '--poisson-window':  config.poissonWindow = parseInt(args[++i], 10); break;
             case '--cross-pool':      config.crossPool = true; break;
+            case '--include-gaps':    config.includeGaps = true; break;
+            case '--gap-threshold':   config.gapThreshold = parseInt(args[++i], 10); break;
             case '--html':            config.html = true;      break;
             case '--json':            config.json = true;      break;
             case '--csv':             config.csv  = true;      break;
