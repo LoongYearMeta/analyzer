@@ -691,38 +691,60 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
         const numBins = Math.max(1, Math.ceil((stats.p99 || stats.max) / binWidth));
         const outlierMin = numBins * binWidth;
 
-        const labels = [], counts = [], colors = [], selfExpCurve = [], btcExpCurve = [], binRanges = [];
-        const lambdaSelf = mu > 0 ? 1 / mu : 0;          // 实测自身指数 Exp(1/μ)（形状参考）
-        const lambdaBtc  = 1 / BTC_TARGET_S;             // BTC 泊松参考 Exp(1/600)
-
+        // 各 bin 频次（闭箱）+ 末尾 >outlier 开箱
+        const counts = [];
         for (let i = 0; i < numBins; i++) {
-            const bMin = i * binWidth, bMax = (i + 1) * binWidth, c = bMin + binWidth / 2;
-            const count = validIv.filter(v => v >= bMin && v < bMax).length;
-            labels.push(i % 5 === 0 ? `${bMin}s` : '');
-            counts.push(count);
-            colors.push(c < mu * 0.5 ? '#27ae60' : c < mu * 1.5 ? '#3498db' : '#e74c3c');
-            binRanges.push({ min: bMin, max: bMax });
-            // 期望频次 = N · binWidth · pdf(c)
-            const pdfSelf = lambdaSelf * Math.exp(-lambdaSelf * c);
-            selfExpCurve.push(+(pdfSelf * validIv.length * binWidth).toFixed(2));
-            const pdfBtc = lambdaBtc * Math.exp(-lambdaBtc * c);
-            btcExpCurve.push(+(pdfBtc * validIv.length * binWidth).toFixed(2));
+            const bMin = i * binWidth, bMax = (i + 1) * binWidth;
+            counts.push(validIv.filter(v => v >= bMin && v < bMax).length);
         }
         const outlierCount = validIv.filter(v => v >= outlierMin).length;
-        if (outlierCount > 0) {
-            labels.push(`>${outlierMin}s`); counts.push(outlierCount); colors.push('#e74c3c');
-            selfExpCurve.push(0); btcExpCurve.push(0); binRanges.push({ min: outlierMin, max: Infinity });
-        }
+        if (outlierCount > 0) counts.push(outlierCount);
 
-        // normalCurve  → 实测自身指数拟合 Exp(1/μ)
-        // normalCurve2 → BTC 泊松参考 Exp(1/600)
-        builder.addBarChart(labels, counts, {
-            title: '出块间隔分布（实测指数拟合 vs BTC 泊松参考 λ=1/600）',
-            xLabel: '间隔时间', yLabel: '频次',
-            colors,
-            normalCurve: selfExpCurve, normalCurveLabel: `实测指数拟合 λ=1/μ (μ=${mu.toFixed(0)}s)`,
-            normalCurve2: btcExpCurve, normalCurve2Label: 'BTC 泊松参考 λ=1/600',
-            binRanges, totalCount: validIv.length,
+        // 四个不重叠区间(分割点 1/10/30 分钟)的出块概率：实测从原始间隔精确统计，BTC 用 CDF
+        const N = validIv.length;
+        const lamB = 1 / BTC_TARGET_S;
+        const empCnt = (a, b) => validIv.filter(v => v >= a && v < b).length / N; // 实测 P(a≤T<b)
+        const Pexp = (a, b, lam) => Math.exp(-lam * a) - Math.exp(-lam * b);      // 理论 P(a<T<b)
+        const pc = v => (v * 100).toFixed(1) + '%';
+        // 轴从 0 起，四个不重叠区间：<1m / 1–10m / 10–30m / >30m，各标自身出块概率
+        const regions = [
+            { name: '快块 <1m',  x0: 0,  x1: 1,  emp: empCnt(0, 60),         btc: Pexp(0, 60, lamB),         fill: 'rgba(39,174,96,0.10)',  line: '#27ae60' },
+            { name: '1–10m',     x0: 1,  x1: 10, emp: empCnt(60, 600),        btc: Pexp(60, 600, lamB),       fill: 'rgba(41,128,185,0.09)', line: '#2980b9' },
+            { name: '10–30m',    x0: 10, x1: 30, emp: empCnt(600, 1800),      btc: Pexp(600, 1800, lamB),     fill: 'rgba(243,156,18,0.10)', line: '#e67e22' },
+            { name: '长块 >30m', x0: 30, x1: 45, emp: empCnt(1800, Infinity), btc: Pexp(1800, Infinity, lamB), fill: 'rgba(231,76,60,0.10)',  line: '#e74c3c' },
+        ];
+        // <1min 细分（注释用）—— 直接数整数计数，避免占比×N 的浮点误差
+        const cntIv = (a, b) => validIv.filter(v => v >= a && v < b).length;
+        const sub1 = cntIv(0, 60), minIv = Math.min(...validIv);
+        const sub1Note = `<br><b>间隔 &lt;1min 细分</b>：共 <b>${sub1}</b> 个（${pc(sub1 / N)}）；`
+            + `&lt;10s ${cntIv(0, 10)} 个、10–30s ${cntIv(10, 30)} 个、30–60s ${cntIv(30, 60)} 个；最短间隔 ${minIv.toFixed(0)}s。`;
+        // 累计概率(用户口径)：P(<m分钟)
+        const cumEmp = m => validIv.filter(v => v < m * 60).length / N;
+        // ≤0 间隔(同刻/乱序)出块的实测核查（validIv 已滤 >0，这里从未过滤的 interval_s 数）
+        const zeroNeg = chain.map(c => c.interval_s).filter(v => v != null && v <= 0).length;
+        // 图内左上角注：≤0 间隔的实测说明
+        const cornerNotes = [
+            { text: zeroNeg > 0 ? `⚠ 间隔≤0(同刻/乱序)的块：${zeroNeg} 个` : `实测无间隔≤0的块（最短 ${minIv.toFixed(0)}s）`, color: '#777' },
+        ];
+        const cumLine = `<br><b>累计概率</b>：`
+            + `P(&lt;1m) 实测${pc(cumEmp(1))}/BTC${pc(1 - Math.exp(-60 * lamB))} · `
+            + `P(&lt;10m) 实测${pc(cumEmp(10))}/BTC${pc(1 - Math.exp(-600 * lamB))} · `
+            + `P(&lt;30m) 实测${pc(cumEmp(30))}/BTC${pc(1 - Math.exp(-1800 * lamB))} · `
+            + `P(&gt;30m) 实测${pc(1 - cumEmp(30))}/BTC${pc(Math.exp(-1800 * lamB))}`;
+
+        // 线性时间轴(0~45min)、纵轴概率密度：曲线下某区间面积=该区间出块概率；10min 处粗分割线
+        builder.addProbDistChart({
+            title: '出块间隔概率分布（实测 vs BTC 理论对比）',
+            caption: '横轴=出块间隔(分钟)。<b>蓝色填充曲线=BTC 理论分布，红线=本链实测</b>；红线贴合蓝线 → 本链出块≈比特币理论。'
+                + '四个区带分别标出 <b>&lt;1m / 1–10m / 10–30m / &gt;30m</b> 各自出块概率(实测 vs BTC 理论，四区相加=100%)；<b>10min 粗线=BTC 目标</b>。'
+                + sub1Note
+                + `<br><b>生成公式</b>：密度曲线 <code>f(t)=λ·e<sup>−λt</sup></code>（速率 λ=1/μ：BTC μ=600s，实测 μ=${mu.toFixed(0)}s）；`
+                + '区间<b>理论</b>概率 <code>P(a≤t&lt;b)=e<sup>−λa</sup>−e<sup>−λb</sup></code>（a、b 单位秒），区间<b>实测</b>概率 = 该区间样本数 ÷ 总数 N。'
+                + '纵轴是概率<b>密度</b>(1/分钟)非概率，概率=曲线下面积；密度在 t→0 处最高(≈λ)、单调下降，这是无记忆泊松过程的真实形状。'
+                + cumLine,
+            counts, closedBins: numBins, totalCount: N,
+            binWidth, muSelf: mu, btcTarget: BTC_TARGET_S,
+            xMinM: 0, xMaxM: 45, boldLineMin: 10, dividers: [1, 10, 30], regions, cornerNotes,
         });
     }
 
@@ -748,9 +770,9 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
                 <tr><td>KS 距离 vs 自身 Exp(1/μ)</td><td>${dev.ksSelf.toFixed(3)}</td><td>纯形状偏离：是否为泊松过程（越小越像）</td></tr>
             </table>
             <p style="font-size:13px;color:#666;">
-                读图：上图(出块间隔分布)紫色虚线是 <strong>BTC 泊松参考（λ=1/600）</strong>，红色实线是<strong>本链自身指数拟合（λ=1/μ）</strong>。
-                若柱状图贴合红线但远离紫线 → 形状是健康泊松、只是节奏与 BTC 不同（μ≠600）；
-                若柱状图连红线都不贴 → 出块过程本身非泊松（CV、KS_自身会同步偏大）。
+                读图：上图(出块间隔概率分布)纵轴是<strong>概率密度</strong>、横轴是<strong>线性时间(分钟)</strong>，<strong>曲线下某区间面积 = 该区间出块概率</strong>。蓝色填充曲线是 <strong>BTC 理论分布（间隔指数 λ=1/600）</strong>，红线是<strong>本链实测</strong>；纵轴是概率<strong>密度</strong>(非概率)，<strong>曲线下面积才是概率</strong>；<strong>10min 粗线 = BTC 目标节奏</strong>。
+                四个区带直接标出 <strong>&lt;1m / 1–10m / 10–30m / &gt;30m</strong> 各自的出块概率（实测 vs BTC 理论，四区相加=100%）：红线贴合蓝线、各区间实测≈理论 → 本链出块≈比特币(健康的泊松过程，间隔指数分布)，只是节奏略不同（μ≈595s vs 600s）；
+                若红线明显偏离蓝线、或某区间实测概率远偏理论 → 间隔非指数（出块过程本身非泊松，CV、KS_自身会同步偏大）。
             </p>`);
     }
 
@@ -878,6 +900,10 @@ function parseArgs() {
             case '--json':            config.json = true;      break;
             case '--csv':             config.csv  = true;      break;
             case '--help': case '-h': printUsage(); process.exit(0);
+            default:
+                // 位置参数：第一个非选项参数当数据文件路径（等价于 --file）
+                if (!args[i].startsWith('-') && config.file == null) config.file = args[i];
+                break;
         }
     }
     return config;
@@ -892,6 +918,7 @@ function printUsage() {
     });
     console.log('\n示例:');
     console.log(`  node ${path.basename(__filename)} --file pool-solutions.ndjson --html`);
+    console.log(`  node ${path.basename(__filename)} ../sub.ndjson --html   # 文件名任意，位置参数即数据文件`);
 }
 
 // ============ 导出和独立运行 ============
