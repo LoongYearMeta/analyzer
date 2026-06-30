@@ -240,21 +240,128 @@ class AnalyzerFramework {
                     break;
 
                 case 'tx-count':
-                    // 交易数量趋势
-                    if (chartData.trend) {
-                        builder.addLineChart(
-                            chartData.trend.labels,
-                            chartData.trend.values,
-                            {
-                                title: `${info.name} - 交易数量趋势`,
-                                height: 100,
-                                label: '交易数量',
-                                color: 'rgb(102, 126, 234)',
-                                fill: true,
-                                xLabel: '区块高度',
-                                yLabel: '交易数量'
-                            }
-                        );
+                    if (data.mode === 'sv2-log' && chartData.mode === 'sv2-log') {
+                        if (chartData.createTotalUs?.values?.length > 0) {
+                            builder.addLineChart(
+                                chartData.createTotalUs.labels,
+                                chartData.createTotalUs.values,
+                                {
+                                    title: `${info.name} - 创建模板耗时 vs 交易数量`,
+                                    height: 100,
+                                    label: '创建模板耗时 (us)',
+                                    color: 'rgb(102, 126, 234)',
+                                    fill: true,
+                                    xLabel: '交易数量',
+                                    yLabel: '耗时 (us)'
+                                }
+                            );
+                        }
+                        if (chartData.createTotalSize?.values?.length > 0) {
+                            builder.addLineChart(
+                                chartData.createTotalSize.labels,
+                                chartData.createTotalSize.values,
+                                {
+                                    title: `${info.name} - 创建模板总大小 vs 交易数量`,
+                                    height: 100,
+                                    label: '总大小 (bytes)',
+                                    color: 'rgb(46, 204, 113)',
+                                    fill: true,
+                                    xLabel: '交易数量',
+                                    yLabel: '总大小 (bytes)'
+                                }
+                            );
+                        }
+                        if (chartData.createCsMainUs?.values?.length > 0) {
+                            builder.addLineChart(
+                                chartData.createCsMainUs.labels,
+                                chartData.createCsMainUs.values,
+                                {
+                                    title: `${info.name} - 创建模板 cs_main 占用 vs 交易数量`,
+                                    height: 100,
+                                    label: 'cs_main (us)',
+                                    color: 'rgb(231, 76, 60)',
+                                    fill: true,
+                                    xLabel: '交易数量',
+                                    yLabel: 'cs_main (us)'
+                                }
+                            );
+                        }
+                        if (chartData.submitProcessUs?.values?.length > 0) {
+                            builder.addLineChart(
+                                chartData.submitProcessUs.labels,
+                                chartData.submitProcessUs.values,
+                                {
+                                    title: `${info.name} - 验证/提交耗时 vs 交易数量`,
+                                    height: 100,
+                                    label: 'ProcessNewBlock (us)',
+                                    color: 'rgb(155, 89, 182)',
+                                    fill: true,
+                                    xLabel: '交易数量',
+                                    yLabel: '耗时 (us)'
+                                }
+                            );
+                        }
+                        if (chartData.submitTotalSize?.values?.length > 0) {
+                            builder.addLineChart(
+                                chartData.submitTotalSize.labels,
+                                chartData.submitTotalSize.values,
+                                {
+                                    title: `${info.name} - 验证模板总大小 vs 交易数量`,
+                                    height: 100,
+                                    label: '总大小 (bytes)',
+                                    color: 'rgb(243, 156, 18)',
+                                    fill: true,
+                                    xLabel: '交易数量',
+                                    yLabel: '总大小 (bytes)'
+                                }
+                            );
+                        }
+                        if (chartData.intervalOccupancy?.values?.length > 0) {
+                            builder.addLineChart(
+                                chartData.intervalOccupancy.labels,
+                                chartData.intervalOccupancy.values,
+                                {
+                                    title: `${info.name} - 相邻高度区间 cs_main 占用比`,
+                                    height: 100,
+                                    label: '占用比',
+                                    color: 'rgb(127, 140, 141)',
+                                    fill: true,
+                                    xLabel: '高度区间',
+                                    yLabel: '占用比'
+                                }
+                            );
+                        }
+                    } else {
+                        if (chartData.trend) {
+                            builder.addLineChart(
+                                chartData.trend.labels,
+                                chartData.trend.values,
+                                {
+                                    title: `${info.name} - 交易数量趋势`,
+                                    height: 100,
+                                    label: '交易数量',
+                                    color: 'rgb(102, 126, 234)',
+                                    fill: true,
+                                    xLabel: '区块高度',
+                                    yLabel: '交易数量'
+                                }
+                            );
+                        }
+                        if (chartData.ancestorRatio?.values?.length > 0) {
+                            builder.addLineChart(
+                                chartData.ancestorRatio.labels,
+                                chartData.ancestorRatio.values,
+                                {
+                                    title: `${info.name} - 区块内交易数 / 最大祖先高度`,
+                                    height: 100,
+                                    label: '比值',
+                                    color: 'rgb(155, 89, 182)',
+                                    fill: true,
+                                    xLabel: '区块高度',
+                                    yLabel: '比值'
+                                }
+                            );
+                        }
                     }
                     // 分布
                     if (chartData.distribution) {
@@ -379,6 +486,14 @@ function parseGlobalArgs() {
             case '-e':
                 config.end = parseInt(args[++i]);
                 break;
+            case '--sv2-log':
+            case '-L':
+                config.sv2LogFile = args[++i];
+                break;
+            case '--ancestor-ratio':
+            case '-A':
+                config.ancestorRatio = true;
+                break;
             case '--block':
             case '-b':
                 config.block = parseInt(args[++i]);
@@ -441,10 +556,12 @@ function printUsage() {
   -b, --block <高度>     目标区块高度（tx-forest 专用）
   -t, --top <N>          可视化前 N 棵最大树（tx-forest 专用，默认: 5）
       --limit <N>        每棵树最多展示节点数（tx-forest 专用，默认: 300）
-      --html             生成统一 HTML 报告（框架统一绘图）
-  -o, --output-dir <目录> 报告输出目录 (默认: ./reports)
-  -l, --list             列出所有可用分析器
-  -h, --help             显示帮助
+	      --html             生成统一 HTML 报告（框架统一绘图）
+      --ancestor-ratio    tx-count 额外计算 区块交易数 / 最大祖先高度
+      --sv2-log <路径>    解析 SV2 性能日志，tx-count 进入日志分析模式
+	  -o, --output-dir <目录> 报告输出目录 (默认: ./reports)
+	  -l, --list             列出所有可用分析器
+	  -h, --help             显示帮助
 
 RPC 选项:
       --rpc-url <地址>   RPC 地址
