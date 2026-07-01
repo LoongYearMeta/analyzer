@@ -182,6 +182,18 @@ function makeLineSeries(points, xFormatter = x => String(x)) {
     };
 }
 
+function usToMs(us) {
+    return us == null ? null : +(us / 1000).toFixed(3);
+}
+
+function usToSeconds(us) {
+    return us == null ? null : +(us / 1e6).toFixed(6);
+}
+
+function bytesToMB(bytes) {
+    return bytes == null ? null : +(bytes / (1024 * 1024)).toFixed(3);
+}
+
 function buildSv2LogAnalysis(records) {
     const create = records.filter(r => r.event === 'template_create' && (r.ok == null || r.ok === 1) && r.height != null);
     const createCsMain = records.filter(r => r.event === 'template_create_cs_main' && r.height != null && r.csMainUs != null);
@@ -205,13 +217,6 @@ function buildSv2LogAnalysis(records) {
         byHeightSubmit.get(r.height).push(r);
     }
 
-    const createSeries = [];
-    const createSizeSeries = [];
-    const createCsMainSeries = [];
-    const submitSeries = [];
-    const submitSizeSeries = [];
-    const intervalSeries = [];
-
     const heights = [...new Set([...byHeight.keys(), ...byHeightCs.keys(), ...byHeightSubmit.keys()])].sort((a, b) => a - b);
     const heightSummaries = [];
 
@@ -228,48 +233,46 @@ function buildSv2LogAnalysis(records) {
             csRows.reduce((max, r) => Math.max(max, r.totalSize || 0), 0) ||
             submitRows.reduce((max, r) => Math.max(max, r.totalSize || 0), 0);
         const totalUs = createRows.reduce((sum, r) => sum + (r.totalUs || 0), 0);
-        const submitUs = submitRows.reduce((sum, r) => sum + (r.processNewBlockUs || 0), 0);
         const txs = createRows.reduce((max, r) => Math.max(max, r.txs || 0), 0) ||
             csRows.reduce((max, r) => Math.max(max, r.txs || 0), 0) ||
             submitRows.reduce((max, r) => Math.max(max, r.txs || 0), 0);
 
         if (createRows.length > 0) {
-            createSeries.push({ x: txs, y: totalUs, height });
-            createSizeSeries.push({ x: txs, y: totalSize, height });
-            heightSummaries.push({ height, startUs, csMainUs, txs, totalSize, totalUs });
-        }
-
-        if (csRows.length > 0) {
-            createCsMainSeries.push({ x: txs, y: csMainUs, height });
-        }
-
-        if (submitRows.length > 0) {
-            submitSeries.push({ x: txs, y: submitUs, height });
-            submitSizeSeries.push({ x: txs, y: totalSize, height });
-        }
-    }
-
-    const orderedHeights = heightSummaries.filter(r => r.startUs != null).sort((a, b) => a.height - b.height);
-    for (let i = 0; i < orderedHeights.length - 1; i++) {
-        const cur = orderedHeights[i];
-        const next = orderedHeights[i + 1];
-        const intervalUs = next.startUs - cur.startUs;
-        if (intervalUs > 0) {
-            intervalSeries.push({
-                x: cur.height,
-                y: +(cur.csMainUs / intervalUs).toFixed(6),
-                height: cur.height,
-                nextHeight: next.height,
-                intervalUs
+            heightSummaries.push({
+                height,
+                startSec: usToSeconds(startUs),
+                csMainMs: usToMs(csMainUs),
+                txs,
+                totalSizeMB: bytesToMB(totalSize),
+                totalMs: usToMs(totalUs)
             });
         }
     }
 
-    const createTotalUs = create.map(r => r.totalUs).filter(v => v != null);
-    const createTotalSize = create.map(r => r.totalSize).filter(v => v != null);
-    const createCsMainUs = createCsMain.map(r => r.csMainUs).filter(v => v != null);
-    const submitProcessUs = submit.map(r => r.processNewBlockUs).filter(v => v != null);
-    const submitTotalSize = submit.map(r => r.totalSize).filter(v => v != null);
+    const createByTx = create
+        .filter(r => r.txs != null && r.totalUs != null)
+        .map(r => ({ x: r.txs, y: usToMs(r.totalUs), height: r.height }));
+    const createBySize = create
+        .filter(r => r.totalSize != null && r.totalUs != null)
+        .map(r => ({ x: bytesToMB(r.totalSize), y: usToMs(r.totalUs), height: r.height }));
+    const createCsMainByTx = createCsMain
+        .filter(r => r.txs != null)
+        .map(r => ({ x: r.txs, y: usToMs(r.csMainUs), height: r.height }));
+    const createCsMainBySize = createCsMain
+        .filter(r => r.totalSize != null)
+        .map(r => ({ x: bytesToMB(r.totalSize), y: usToMs(r.csMainUs), height: r.height }));
+    const submitByTx = submit
+        .filter(r => r.txs != null && r.processNewBlockUs != null)
+        .map(r => ({ x: r.txs, y: usToMs(r.processNewBlockUs), height: r.height }));
+    const submitBySize = submit
+        .filter(r => r.totalSize != null && r.processNewBlockUs != null)
+        .map(r => ({ x: bytesToMB(r.totalSize), y: usToMs(r.processNewBlockUs), height: r.height }));
+
+    const createTotalMs = create.map(r => usToMs(r.totalUs)).filter(v => v != null);
+    const createTotalMB = create.map(r => bytesToMB(r.totalSize)).filter(v => v != null);
+    const createCsMainMs = createCsMain.map(r => usToMs(r.csMainUs)).filter(v => v != null);
+    const submitProcessMs = submit.map(r => usToMs(r.processNewBlockUs)).filter(v => v != null);
+    const submitTotalMB = submit.map(r => bytesToMB(r.totalSize)).filter(v => v != null);
 
     const warnings = [];
     if (records.some(r => !r.hasTimestamp)) {
@@ -285,22 +288,20 @@ function buildSv2LogAnalysis(records) {
         createCsMain,
         submit,
         series: {
-            createTotalUs: makeLineSeries(createSeries, x => String(x)),
-            createTotalSize: makeLineSeries(createSizeSeries, x => String(x)),
-            createCsMainUs: makeLineSeries(createCsMainSeries, x => String(x)),
-            submitProcessUs: makeLineSeries(submitSeries, x => String(x)),
-            submitTotalSize: makeLineSeries(submitSizeSeries, x => String(x)),
-            intervalOccupancy: makeLineSeries(intervalSeries, x => `h${x}->h${x + 1}`)
+            createByTx,
+            createBySize,
+            createCsMainByTx,
+            createCsMainBySize,
+            submitByTx,
+            submitBySize
         },
         stats: {
-            createTotalUs: createTotalUs.length ? analyze(createTotalUs) : null,
-            createTotalSize: createTotalSize.length ? analyze(createTotalSize) : null,
-            createCsMainUs: createCsMainUs.length ? analyze(createCsMainUs) : null,
-            submitProcessUs: submitProcessUs.length ? analyze(submitProcessUs) : null,
-            submitTotalSize: submitTotalSize.length ? analyze(submitTotalSize) : null
+            createTotalMs: createTotalMs.length ? analyze(createTotalMs) : null,
+            createTotalMB: createTotalMB.length ? analyze(createTotalMB) : null,
+            createCsMainMs: createCsMainMs.length ? analyze(createCsMainMs) : null,
+            submitProcessMs: submitProcessMs.length ? analyze(submitProcessMs) : null,
+            submitTotalMB: submitTotalMB.length ? analyze(submitTotalMB) : null
         },
-        heights: orderedHeights,
-        intervalSeries,
         warnings
     };
 }
@@ -325,82 +326,58 @@ function buildSv2Html(builder, analysis, titlePrefix) {
     if (analysis.warnings.length > 0) {
         builder.addNote(`<h3>说明</h3><ul>${analysis.warnings.map(w => `<li>${w}</li>`).join('')}</ul>`);
     }
-    if (s.createTotalUs.values.length > 0) {
-        builder.addLineChart(s.createTotalUs.labels, s.createTotalUs.values, {
-            title: `${titlePrefix} - 创建模板耗时 vs 交易数量`,
-            label: '创建模板耗时 (us)',
-            borderColor: 'rgb(102, 126, 234)',
-            backgroundColor: 'rgba(102, 126, 234, 0.1)',
-            fill: true,
-            tension: 0.2,
-            pointRadius: 0,
+    if (s.createByTx.length > 0) {
+        builder.addScatterChart(s.createByTx, {
+            title: `${titlePrefix} - 创建模板总耗时 vs 交易数量`,
             xLabel: '交易数量',
-            yLabel: '耗时 (us)'
+            yLabel: '耗时 (ms)',
+            pointRadius: 3,
+            yMin: 0
         });
     }
-    if (s.createTotalSize.values.length > 0) {
-        builder.addLineChart(s.createTotalSize.labels, s.createTotalSize.values, {
-            title: `${titlePrefix} - 创建模板总大小 vs 交易数量`,
-            label: '总大小 (bytes)',
-            borderColor: 'rgb(46, 204, 113)',
-            backgroundColor: 'rgba(46, 204, 113, 0.1)',
-            fill: true,
-            tension: 0.2,
-            pointRadius: 0,
-            xLabel: '交易数量',
-            yLabel: '总大小 (bytes)'
+    if (s.createBySize.length > 0) {
+        builder.addScatterChart(s.createBySize, {
+            title: `${titlePrefix} - 创建模板总耗时 vs 模板总大小`,
+            xLabel: '模板总大小 (MB)',
+            yLabel: '耗时 (ms)',
+            pointRadius: 3,
+            yMin: 0
         });
     }
-    if (s.createCsMainUs.values.length > 0) {
-        builder.addLineChart(s.createCsMainUs.labels, s.createCsMainUs.values, {
+    if (s.createCsMainByTx.length > 0) {
+        builder.addScatterChart(s.createCsMainByTx, {
             title: `${titlePrefix} - 创建模板 cs_main 占用 vs 交易数量`,
-            label: 'cs_main (us)',
-            borderColor: 'rgb(231, 76, 60)',
-            backgroundColor: 'rgba(231, 76, 60, 0.1)',
-            fill: true,
-            tension: 0.2,
-            pointRadius: 0,
             xLabel: '交易数量',
-            yLabel: 'cs_main (us)'
+            yLabel: '耗时 (ms)',
+            pointRadius: 3,
+            yMin: 0
         });
     }
-    if (s.submitProcessUs.values.length > 0) {
-        builder.addLineChart(s.submitProcessUs.labels, s.submitProcessUs.values, {
-            title: `${titlePrefix} - 验证/提交耗时 vs 交易数量`,
-            label: 'ProcessNewBlock (us)',
-            borderColor: 'rgb(155, 89, 182)',
-            backgroundColor: 'rgba(155, 89, 182, 0.1)',
-            fill: true,
-            tension: 0.2,
-            pointRadius: 0,
-            xLabel: '交易数量',
-            yLabel: '耗时 (us)'
+    if (s.createCsMainBySize.length > 0) {
+        builder.addScatterChart(s.createCsMainBySize, {
+            title: `${titlePrefix} - 创建模板 cs_main 占用 vs 模板总大小`,
+            xLabel: '模板总大小 (MB)',
+            yLabel: '耗时 (ms)',
+            pointRadius: 3,
+            yMin: 0
         });
     }
-    if (s.submitTotalSize.values.length > 0) {
-        builder.addLineChart(s.submitTotalSize.labels, s.submitTotalSize.values, {
-            title: `${titlePrefix} - 验证模板总大小 vs 交易数量`,
-            label: '总大小 (bytes)',
-            borderColor: 'rgb(243, 156, 18)',
-            backgroundColor: 'rgba(243, 156, 18, 0.1)',
-            fill: true,
-            tension: 0.2,
-            pointRadius: 0,
+    if (s.submitByTx.length > 0) {
+        builder.addScatterChart(s.submitByTx, {
+            title: `${titlePrefix} - 验证/提交总耗时 vs 交易数量`,
             xLabel: '交易数量',
-            yLabel: '总大小 (bytes)'
+            yLabel: '耗时 (ms)',
+            pointRadius: 3,
+            yMin: 0
         });
     }
-    if (s.intervalOccupancy.values.length > 0) {
-        builder.addLineChart(s.intervalOccupancy.labels, s.intervalOccupancy.values, {
-            title: `${titlePrefix} - 相邻高度区间 cs_main 占用比`,
-            label: '占用比',
-            borderColor: 'rgb(127, 140, 141)',
-            backgroundColor: 'rgba(127, 140, 141, 0.1)',
-            fill: true,
-            tension: 0.2,
-            pointRadius: 0,
-            xLabel: '高度区间',
-            yLabel: '占用比'
+    if (s.submitBySize.length > 0) {
+        builder.addScatterChart(s.submitBySize, {
+            title: `${titlePrefix} - 验证/提交总耗时 vs 模板总大小`,
+            xLabel: '模板总大小 (MB)',
+            yLabel: '耗时 (ms)',
+            pointRadius: 3,
+            yMin: 0
         });
     }
 }
@@ -730,20 +707,18 @@ async function analyzeSv2Log(config = {}, reporter = new Reporter({ silent: conf
         analysis.warnings.forEach(w => reporter.log(`- ${w}`));
     }
 
-    const createUs = analysis.create.map(r => r.totalUs).filter(v => v != null);
-    const createSize = analysis.create.map(r => r.totalSize).filter(v => v != null);
-    const createCsMain = analysis.createCsMain.map(r => r.csMainUs).filter(v => v != null);
-    const submitUs = analysis.submit.map(r => r.processNewBlockUs).filter(v => v != null);
-    const submitSize = analysis.submit.map(r => r.totalSize).filter(v => v != null);
-    const intervalRatio = analysis.intervalSeries.map(r => r.y);
+    const createMs = analysis.create.map(r => usToMs(r.totalUs)).filter(v => v != null);
+    const createSizeMB = analysis.create.map(r => bytesToMB(r.totalSize)).filter(v => v != null);
+    const createCsMainMs = analysis.createCsMain.map(r => usToMs(r.csMainUs)).filter(v => v != null);
+    const submitMs = analysis.submit.map(r => usToMs(r.processNewBlockUs)).filter(v => v != null);
+    const submitSizeMB = analysis.submit.map(r => bytesToMB(r.totalSize)).filter(v => v != null);
 
     reporter.section('统计结果');
-    if (createUs.length) reporter.kv('创建模板耗时均值(us)', analyze(createUs).mean.toFixed(2));
-    if (createSize.length) reporter.kv('创建模板总大小均值(bytes)', analyze(createSize).mean.toFixed(2));
-    if (createCsMain.length) reporter.kv('创建模板 cs_main 均值(us)', analyze(createCsMain).mean.toFixed(2));
-    if (submitUs.length) reporter.kv('验证/提交耗时均值(us)', analyze(submitUs).mean.toFixed(2));
-    if (submitSize.length) reporter.kv('验证模板总大小均值(bytes)', analyze(submitSize).mean.toFixed(2));
-    if (intervalRatio.length) reporter.kv('相邻高度区间 cs_main 占用比均值', analyze(intervalRatio).mean.toFixed(6));
+    if (createMs.length) reporter.kv('创建模板耗时均值(ms)', analyze(createMs).mean.toFixed(3));
+    if (createSizeMB.length) reporter.kv('创建模板总大小均值(MB)', analyze(createSizeMB).mean.toFixed(3));
+    if (createCsMainMs.length) reporter.kv('创建模板 cs_main 均值(ms)', analyze(createCsMainMs).mean.toFixed(3));
+    if (submitMs.length) reporter.kv('验证/提交耗时均值(ms)', analyze(submitMs).mean.toFixed(3));
+    if (submitSizeMB.length) reporter.kv('验证模板总大小均值(MB)', analyze(submitSizeMB).mean.toFixed(3));
 
     const result = {
         info: ANALYZER_INFO,
@@ -754,39 +729,59 @@ async function analyzeSv2Log(config = {}, reporter = new Reporter({ silent: conf
             analysis,
             chartData: {
                 mode: 'sv2-log',
-                createTotalUs: analysis.series.createTotalUs,
-                createTotalSize: analysis.series.createTotalSize,
-                createCsMainUs: analysis.series.createCsMainUs,
-                submitProcessUs: analysis.series.submitProcessUs,
-                submitTotalSize: analysis.series.submitTotalSize,
-                intervalOccupancy: analysis.series.intervalOccupancy
+                createByTx: analysis.series.createByTx,
+                createBySize: analysis.series.createBySize,
+                createCsMainByTx: analysis.series.createCsMainByTx,
+                createCsMainBySize: analysis.series.createCsMainBySize,
+                submitByTx: analysis.series.submitByTx,
+                submitBySize: analysis.series.submitBySize
             }
         }
     };
 
     if (config.chart) {
         reporter.section('SV2 关系图');
-        new LineChart(80, 12).draw(analysis.series.createTotalUs.values, analysis.series.createTotalUs.labels, {
-            pointChar: '●',
-            yRange: { min: 0 }
-        }).print('创建模板耗时 vs 交易数量');
-        new LineChart(80, 12).draw(analysis.series.createTotalSize.values, analysis.series.createTotalSize.labels, {
-            pointChar: '●',
-            yRange: { min: 0 }
-        }).print('创建模板总大小 vs 交易数量');
-        new LineChart(80, 12).draw(analysis.series.createCsMainUs.values, analysis.series.createCsMainUs.labels, {
-            pointChar: '●',
-            yRange: { min: 0 }
-        }).print('创建模板 cs_main vs 交易数量');
-        new LineChart(80, 12).draw(analysis.series.submitProcessUs.values, analysis.series.submitProcessUs.labels, {
-            pointChar: '●',
-            yRange: { min: 0 }
-        }).print('验证/提交耗时 vs 交易数量');
-        if (analysis.series.intervalOccupancy.values.length > 0) {
-            new LineChart(80, 12).draw(analysis.series.intervalOccupancy.values, analysis.series.intervalOccupancy.labels, {
-                pointChar: '●',
-                yRange: { min: 0 }
-            }).print('相邻高度区间 cs_main 占用比');
+        if (analysis.series.createByTx.length > 0) {
+            new LineChart(80, 12).draw(
+                analysis.series.createByTx.map(p => p.y),
+                analysis.series.createByTx.map(p => String(p.x)),
+                { pointChar: '●', yRange: { min: 0 } }
+            ).print('创建模板总耗时(ms) vs 交易数量');
+        }
+        if (analysis.series.createBySize.length > 0) {
+            new LineChart(80, 12).draw(
+                analysis.series.createBySize.map(p => p.y),
+                analysis.series.createBySize.map(p => p.x.toFixed(2)),
+                { pointChar: '●', yRange: { min: 0 } }
+            ).print('创建模板总耗时(ms) vs 模板总大小(MB)');
+        }
+        if (analysis.series.createCsMainByTx.length > 0) {
+            new LineChart(80, 12).draw(
+                analysis.series.createCsMainByTx.map(p => p.y),
+                analysis.series.createCsMainByTx.map(p => String(p.x)),
+                { pointChar: '●', yRange: { min: 0 } }
+            ).print('创建模板 cs_main 占用(ms) vs 交易数量');
+        }
+        if (analysis.series.createCsMainBySize.length > 0) {
+            new LineChart(80, 12).draw(
+                analysis.series.createCsMainBySize.map(p => p.y),
+                analysis.series.createCsMainBySize.map(p => p.x.toFixed(2)),
+                { pointChar: '●', yRange: { min: 0 } }
+            ).print('创建模板 cs_main 占用(ms) vs 模板总大小(MB)');
+        }
+        if (analysis.series.submitByTx.length > 0) {
+            new LineChart(80, 12).draw(
+                analysis.series.submitByTx.map(p => p.y),
+                analysis.series.submitByTx.map(p => String(p.x)),
+                { pointChar: '●', yRange: { min: 0 } }
+            ).print('验证/提交总耗时(ms) vs 交易数量');
+        }
+        if (analysis.series.submitBySize.length > 0) {
+            new LineChart(80, 12).draw(
+                analysis.series.submitBySize.map(p => p.y),
+                analysis.series.submitBySize.map(p => p.x.toFixed(2)),
+                { pointChar: '●', yRange: { min: 0 } }
+            ).print('验证/提交总耗时(ms) vs 模板总大小(MB)');
         }
     }
 
@@ -807,9 +802,15 @@ async function analyzeSv2Log(config = {}, reporter = new Reporter({ silent: conf
 function parseArgs() {
     const args = process.argv.slice(2);
     const config = { rpc: {} };
+    const positional = [];
+    const unknown = [];
 
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
+        if (!arg.startsWith('-')) {
+            positional.push(arg);
+            continue;
+        }
         switch (arg) {
             case '--start':
             case '-s':
@@ -844,7 +845,16 @@ function parseArgs() {
             case '-h':
                 printUsage();
                 process.exit(0);
+            default:
+                unknown.push(arg);
         }
+    }
+
+    if (unknown.length > 0) {
+        throw new Error(`未知参数: ${unknown.join(', ')}\n正确写法: node ${__filename} --sv2-log ../bit.log --html`);
+    }
+    if (positional.length > 0) {
+        throw new Error(`发现位置参数: ${positional.join(', ')}\n日志文件必须通过 --sv2-log <路径> 传入，例如: node ${__filename} --sv2-log ../bit.log --html`);
     }
 
     return config;

@@ -241,95 +241,65 @@ class AnalyzerFramework {
 
                 case 'tx-count':
                     if (data.mode === 'sv2-log' && chartData.mode === 'sv2-log') {
-                        if (chartData.createTotalUs?.values?.length > 0) {
-                            builder.addLineChart(
-                                chartData.createTotalUs.labels,
-                                chartData.createTotalUs.values,
-                                {
-                                    title: `${info.name} - 创建模板耗时 vs 交易数量`,
-                                    height: 100,
-                                    label: '创建模板耗时 (us)',
-                                    color: 'rgb(102, 126, 234)',
-                                    fill: true,
-                                    xLabel: '交易数量',
-                                    yLabel: '耗时 (us)'
-                                }
-                            );
+                        if (chartData.createByTx?.length > 0) {
+                            builder.addScatterChart(chartData.createByTx, {
+                                title: `${info.name} - 创建模板总耗时 vs 交易数量`,
+                                height: 100,
+                                xLabel: '交易数量',
+                                yLabel: '耗时 (ms)',
+                                pointRadius: 3,
+                                yMin: 0
+                            });
                         }
-                        if (chartData.createTotalSize?.values?.length > 0) {
-                            builder.addLineChart(
-                                chartData.createTotalSize.labels,
-                                chartData.createTotalSize.values,
-                                {
-                                    title: `${info.name} - 创建模板总大小 vs 交易数量`,
-                                    height: 100,
-                                    label: '总大小 (bytes)',
-                                    color: 'rgb(46, 204, 113)',
-                                    fill: true,
-                                    xLabel: '交易数量',
-                                    yLabel: '总大小 (bytes)'
-                                }
-                            );
+                        if (chartData.createBySize?.length > 0) {
+                            builder.addScatterChart(chartData.createBySize, {
+                                title: `${info.name} - 创建模板总耗时 vs 模板总大小`,
+                                height: 100,
+                                xLabel: '模板总大小 (MB)',
+                                yLabel: '耗时 (ms)',
+                                pointRadius: 3,
+                                yMin: 0
+                            });
                         }
-                        if (chartData.createCsMainUs?.values?.length > 0) {
-                            builder.addLineChart(
-                                chartData.createCsMainUs.labels,
-                                chartData.createCsMainUs.values,
-                                {
-                                    title: `${info.name} - 创建模板 cs_main 占用 vs 交易数量`,
-                                    height: 100,
-                                    label: 'cs_main (us)',
-                                    color: 'rgb(231, 76, 60)',
-                                    fill: true,
-                                    xLabel: '交易数量',
-                                    yLabel: 'cs_main (us)'
-                                }
-                            );
+                        if (chartData.createCsMainByTx?.length > 0) {
+                            builder.addScatterChart(chartData.createCsMainByTx, {
+                                title: `${info.name} - 创建模板 cs_main 占用 vs 交易数量`,
+                                height: 100,
+                                xLabel: '交易数量',
+                                yLabel: '耗时 (ms)',
+                                pointRadius: 3,
+                                yMin: 0
+                            });
                         }
-                        if (chartData.submitProcessUs?.values?.length > 0) {
-                            builder.addLineChart(
-                                chartData.submitProcessUs.labels,
-                                chartData.submitProcessUs.values,
-                                {
-                                    title: `${info.name} - 验证/提交耗时 vs 交易数量`,
-                                    height: 100,
-                                    label: 'ProcessNewBlock (us)',
-                                    color: 'rgb(155, 89, 182)',
-                                    fill: true,
-                                    xLabel: '交易数量',
-                                    yLabel: '耗时 (us)'
-                                }
-                            );
+                        if (chartData.createCsMainBySize?.length > 0) {
+                            builder.addScatterChart(chartData.createCsMainBySize, {
+                                title: `${info.name} - 创建模板 cs_main 占用 vs 模板总大小`,
+                                height: 100,
+                                xLabel: '模板总大小 (MB)',
+                                yLabel: '耗时 (ms)',
+                                pointRadius: 3,
+                                yMin: 0
+                            });
                         }
-                        if (chartData.submitTotalSize?.values?.length > 0) {
-                            builder.addLineChart(
-                                chartData.submitTotalSize.labels,
-                                chartData.submitTotalSize.values,
-                                {
-                                    title: `${info.name} - 验证模板总大小 vs 交易数量`,
-                                    height: 100,
-                                    label: '总大小 (bytes)',
-                                    color: 'rgb(243, 156, 18)',
-                                    fill: true,
-                                    xLabel: '交易数量',
-                                    yLabel: '总大小 (bytes)'
-                                }
-                            );
+                        if (chartData.submitByTx?.length > 0) {
+                            builder.addScatterChart(chartData.submitByTx, {
+                                title: `${info.name} - 验证/提交总耗时 vs 交易数量`,
+                                height: 100,
+                                xLabel: '交易数量',
+                                yLabel: '耗时 (ms)',
+                                pointRadius: 3,
+                                yMin: 0
+                            });
                         }
-                        if (chartData.intervalOccupancy?.values?.length > 0) {
-                            builder.addLineChart(
-                                chartData.intervalOccupancy.labels,
-                                chartData.intervalOccupancy.values,
-                                {
-                                    title: `${info.name} - 相邻高度区间 cs_main 占用比`,
-                                    height: 100,
-                                    label: '占用比',
-                                    color: 'rgb(127, 140, 141)',
-                                    fill: true,
-                                    xLabel: '高度区间',
-                                    yLabel: '占用比'
-                                }
-                            );
+                        if (chartData.submitBySize?.length > 0) {
+                            builder.addScatterChart(chartData.submitBySize, {
+                                title: `${info.name} - 验证/提交总耗时 vs 模板总大小`,
+                                height: 100,
+                                xLabel: '模板总大小 (MB)',
+                                yLabel: '耗时 (ms)',
+                                pointRadius: 3,
+                                yMin: 0
+                            });
                         }
                     } else {
                         if (chartData.trend) {
