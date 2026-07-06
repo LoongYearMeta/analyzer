@@ -703,30 +703,36 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
 
     // ---- 图4 出块间隔分布直方图（指数分布参考）----
     const validIv = chain.map(c => c.interval_s).filter(v => v != null && v > 0);
-    if (validIv.length >= 2) {
-        const sigma = stats.stdDev;
-        const sorted = [...validIv].sort((a, b) => a - b);
-        const q1 = sorted[Math.floor(sorted.length * 0.25)];
-        const q3 = sorted[Math.floor(sorted.length * 0.75)];
-        const iqr = q3 - q1;
-        const fdWidth = 2 * iqr * Math.pow(validIv.length, -1 / 3);
-        const binWidth = Math.max(5, Math.round(fdWidth || 5));
-        const numBins = Math.max(1, Math.ceil((stats.p99 || stats.max) / binWidth));
-        const outlierMin = numBins * binWidth;
+    {
+        const hasEnoughIntervals = validIv.length >= 2;
+        const fallbackBinWidth = 5;
+        let binWidth = fallbackBinWidth;
+        let numBins = 0;
+        let counts = [];
 
-        // 各 bin 频次（闭箱）+ 末尾 >outlier 开箱
-        const counts = [];
-        for (let i = 0; i < numBins; i++) {
-            const bMin = i * binWidth, bMax = (i + 1) * binWidth;
-            counts.push(validIv.filter(v => v >= bMin && v < bMax).length);
+        if (hasEnoughIntervals) {
+            const sorted = [...validIv].sort((a, b) => a - b);
+            const q1 = sorted[Math.floor(sorted.length * 0.25)];
+            const q3 = sorted[Math.floor(sorted.length * 0.75)];
+            const iqr = q3 - q1;
+            const fdWidth = 2 * iqr * Math.pow(validIv.length, -1 / 3);
+            binWidth = Math.max(fallbackBinWidth, Math.round(fdWidth || fallbackBinWidth));
+            numBins = Math.max(1, Math.ceil((stats.p99 || stats.max) / binWidth));
+            const outlierMin = numBins * binWidth;
+
+            // 各 bin 频次（闭箱）+ 末尾 >outlier 开箱
+            for (let i = 0; i < numBins; i++) {
+                const bMin = i * binWidth, bMax = (i + 1) * binWidth;
+                counts.push(validIv.filter(v => v >= bMin && v < bMax).length);
+            }
+            const outlierCount = validIv.filter(v => v >= outlierMin).length;
+            if (outlierCount > 0) counts.push(outlierCount);
         }
-        const outlierCount = validIv.filter(v => v >= outlierMin).length;
-        if (outlierCount > 0) counts.push(outlierCount);
 
         // 四个不重叠区间(分割点 1/10/30 分钟)的出块概率：实测从原始间隔精确统计，BTC 用 CDF
         const N = validIv.length;
         const lamB = 1 / BTC_TARGET_S;
-        const empCnt = (a, b) => validIv.filter(v => v >= a && v < b).length / N; // 实测 P(a≤T<b)
+        const empCnt = (a, b) => N > 0 ? validIv.filter(v => v >= a && v < b).length / N : null; // 实测 P(a≤T<b)
         const Pexp = (a, b, lam) => Math.exp(-lam * a) - Math.exp(-lam * b);      // 理论 P(a<T<b)
         const pc = v => (v * 100).toFixed(1) + '%';
         // 轴从 0 起，四个不重叠区间：<1m / 1–10m / 10–30m / >30m，各标自身出块概率
@@ -738,22 +744,27 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
         ];
         // <1min 细分（注释用）—— 直接数整数计数，避免占比×N 的浮点误差
         const cntIv = (a, b) => validIv.filter(v => v >= a && v < b).length;
-        const sub1 = cntIv(0, 60), minIv = Math.min(...validIv);
-        const sub1Note = `<br><b>间隔 &lt;1min 细分</b>：共 <b>${sub1}</b> 个（${pc(sub1 / N)}）；`
-            + `&lt;10s ${cntIv(0, 10)} 个、10–30s ${cntIv(10, 30)} 个、30–60s ${cntIv(30, 60)} 个；最短间隔 ${minIv.toFixed(0)}s。`;
+        const sub1 = cntIv(0, 60), minIv = validIv.length ? Math.min(...validIv) : null;
+        const sub1Note = N > 0
+            ? `<br><b>间隔 &lt;1min 细分</b>：共 <b>${sub1}</b> 个（${pc(sub1 / N)}）；`
+                + `&lt;10s ${cntIv(0, 10)} 个、10–30s ${cntIv(10, 30)} 个、30–60s ${cntIv(30, 60)} 个；最短间隔 ${minIv.toFixed(0)}s。`
+            : '<br><b>实测间隔样本不足</b>：未能计算本链实测密度，仅显示 BTC 理论曲线。';
         // 累计概率(用户口径)：P(<m分钟)
-        const cumEmp = m => validIv.filter(v => v < m * 60).length / N;
+        const cumEmp = m => N > 0 ? validIv.filter(v => v < m * 60).length / N : null;
         // ≤0 间隔(同刻/乱序)出块的实测核查（validIv 已滤 >0，这里从未过滤的 interval_s 数）
         const zeroNeg = chain.map(c => c.interval_s).filter(v => v != null && v <= 0).length;
         // 图内左上角注：≤0 间隔的实测说明
         const cornerNotes = [
-            { text: zeroNeg > 0 ? `⚠ 间隔≤0(同刻/乱序)的块：${zeroNeg} 个` : `实测无间隔≤0的块（最短 ${minIv.toFixed(0)}s）`, color: '#777' },
+            { text: zeroNeg > 0 ? `⚠ 间隔≤0(同刻/乱序)的块：${zeroNeg} 个` : (minIv != null ? `实测无间隔≤0的块（最短 ${minIv.toFixed(0)}s）` : '实测有效间隔不足，BTC理论曲线仍独立显示'), color: '#777' },
         ];
-        const cumLine = `<br><b>累计概率</b>：`
-            + `P(&lt;1m) 实测${pc(cumEmp(1))}/BTC${pc(1 - Math.exp(-60 * lamB))} · `
-            + `P(&lt;10m) 实测${pc(cumEmp(10))}/BTC${pc(1 - Math.exp(-600 * lamB))} · `
-            + `P(&lt;30m) 实测${pc(cumEmp(30))}/BTC${pc(1 - Math.exp(-1800 * lamB))} · `
-            + `P(&gt;30m) 实测${pc(1 - cumEmp(30))}/BTC${pc(Math.exp(-1800 * lamB))}`;
+        const cumLine = N > 0
+            ? `<br><b>累计概率</b>：`
+                + `P(&lt;1m) 实测${pc(cumEmp(1))}/BTC${pc(1 - Math.exp(-60 * lamB))} · `
+                + `P(&lt;10m) 实测${pc(cumEmp(10))}/BTC${pc(1 - Math.exp(-600 * lamB))} · `
+                + `P(&lt;30m) 实测${pc(cumEmp(30))}/BTC${pc(1 - Math.exp(-1800 * lamB))} · `
+                + `P(&gt;30m) 实测${pc(1 - cumEmp(30))}/BTC${pc(Math.exp(-1800 * lamB))}`
+            : `<br><b>累计概率</b>：BTC P(&lt;1m) ${pc(1 - Math.exp(-60 * lamB))} · P(&lt;10m) ${pc(1 - Math.exp(-600 * lamB))} · P(&lt;30m) ${pc(1 - Math.exp(-1800 * lamB))} · P(&gt;30m) ${pc(Math.exp(-1800 * lamB))}`;
+        const muText = hasEnoughIntervals && Number.isFinite(mu) && mu > 0 ? `${mu.toFixed(0)}s` : '样本不足';
 
         // 线性时间轴(0~45min)、纵轴概率密度：曲线下某区间面积=该区间出块概率；10min 处粗分割线
         builder.addProbDistChart({
@@ -761,7 +772,7 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
             caption: '横轴=出块间隔(分钟)。<b>蓝色填充曲线=BTC 理论分布，红线=本链实测</b>；红线贴合蓝线 → 本链出块≈比特币理论。'
                 + '四个区带分别标出 <b>&lt;1m / 1–10m / 10–30m / &gt;30m</b> 各自出块概率(实测 vs BTC 理论，四区相加=100%)；<b>10min 粗线=BTC 目标</b>。'
                 + sub1Note
-                + `<br><b>生成公式</b>：密度曲线 <code>f(t)=λ·e<sup>−λt</sup></code>（速率 λ=1/μ：BTC μ=600s，实测 μ=${mu.toFixed(0)}s）；`
+                + `<br><b>生成公式</b>：密度曲线 <code>f(t)=λ·e<sup>−λt</sup></code>（速率 λ=1/μ：BTC μ=600s，实测 μ=${muText}）；`
                 + '区间<b>理论</b>概率 <code>P(a≤t&lt;b)=e<sup>−λa</sup>−e<sup>−λb</sup></code>（a、b 单位秒），区间<b>实测</b>概率 = 该区间样本数 ÷ 总数 N。'
                 + '纵轴是概率<b>密度</b>(1/分钟)非概率，概率=曲线下面积；密度在 t→0 处最高(≈λ)、单调下降，这是无记忆泊松过程的真实形状。'
                 + cumLine,
