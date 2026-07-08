@@ -110,6 +110,19 @@ function normHash(h) {
     return h.toLowerCase().replace(/^0x/, '');
 }
 
+function minMax(values) {
+    let min = Infinity;
+    let max = -Infinity;
+    let count = 0;
+    for (const v of values) {
+        if (v == null || Number.isNaN(v)) continue;
+        if (v < min) min = v;
+        if (v > max) max = v;
+        count++;
+    }
+    return count ? { min, max, count } : null;
+}
+
 // ============ 与 BTC 泊松出块的偏离量化 ============
 //
 // BTC 出块目标 600s，间隔服从指数分布 Exp(λ=1/600)，CDF F(t)=1−e^(−t/600)。
@@ -261,8 +274,8 @@ function buildChainView(records) {
     }
 
     // 3) 从最高高度回溯
-    const heights = unique.map(r => r.block_height);
-    const maxHeight = Math.max(...heights), minHeight = Math.min(...heights);
+    const heightRange = minMax(unique.map(r => r.block_height));
+    const maxHeight = heightRange.max, minHeight = heightRange.min;
     const hashIndex = new Map(unique.map(r => [norm(r.block_hash), r]));
     const walkBack = (tip) => {
         const path = [], seen = new Set();
@@ -413,7 +426,8 @@ function analyzePoolSolutions(config = {}) {
     if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
     const stamp = Date.now();
     const heightsAll = [...byHeight.keys()].filter(h => h != null);
-    const fileRange = heightsAll.length ? `${Math.min(...heightsAll)}_${Math.max(...heightsAll)}_` : '';
+    const heightsAllRange = minMax(heightsAll);
+    const fileRange = heightsAllRange ? `${heightsAllRange.min}_${heightsAllRange.max}_` : '';
 
     if (config.json) {
         const p = path.join(outDir, `pool-solutions_${fileRange}${stamp}.json`);
@@ -539,7 +553,8 @@ function buildPoissonView(chain, windowSec, opts = {}) {
     }
     flush();
     if (counts.length < 1) return null;
-    const maxK = Math.max(...counts);
+    const countRange = minMax(counts);
+    const maxK = countRange ? countRange.max : 0;
     const hist = new Array(maxK + 1).fill(0);
     for (const c of counts) hist[c]++;
     const meanCount = counts.reduce((a, b) => a + b, 0) / counts.length;
@@ -585,7 +600,8 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
     // ---- 图2 出块间隔散点图（pool_submit_time 时钟）----
     const ivPts = chain.filter(c => c.interval_s != null && c.pool_submit_ms != null);
     if (ivPts.length) {
-        const logYMin = parseFloat((Math.min(...ivPts.map(p => p.interval_s).filter(v => v > 0), 60) / 60 * 0.5).toFixed(4));
+        const positiveIvRange = minMax(ivPts.map(p => p.interval_s).filter(v => v > 0));
+        const logYMin = parseFloat((Math.min(positiveIvRange ? positiveIvRange.min : 60, 60) / 60 * 0.5).toFixed(4));
         builder.addScatterTimeChart(
             ivPts.map(c => ({
                 x: Math.floor(c.pool_submit_ms / 1000),
@@ -744,7 +760,8 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
         ];
         // <1min 细分（注释用）—— 直接数整数计数，避免占比×N 的浮点误差
         const cntIv = (a, b) => validIv.filter(v => v >= a && v < b).length;
-        const sub1 = cntIv(0, 60), minIv = validIv.length ? Math.min(...validIv) : null;
+        const validIvRange = minMax(validIv);
+        const sub1 = cntIv(0, 60), minIv = validIvRange ? validIvRange.min : null;
         const sub1Note = N > 0
             ? `<br><b>间隔 &lt;1min 细分</b>：共 <b>${sub1}</b> 个（${pc(sub1 / N)}）；`
                 + `&lt;10s ${cntIv(0, 10)} 个、10–30s ${cntIv(10, 30)} 个、30–60s ${cntIv(30, 60)} 个；最短间隔 ${minIv.toFixed(0)}s。`
@@ -940,8 +957,9 @@ function buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRec
 
     // 标题/文件名附带高度范围，如「Pool 出块记录分析报告 (836261-836370)」
     const heights = [...byHeight.keys()].filter(h => h != null);
-    const titleRange = heights.length ? ` (${Math.min(...heights)}-${Math.max(...heights)})` : '';
-    const fileRange = heights.length ? `${Math.min(...heights)}_${Math.max(...heights)}_` : '';
+    const heightRange = minMax(heights);
+    const titleRange = heightRange ? ` (${heightRange.min}-${heightRange.max})` : '';
+    const fileRange = heightRange ? `${heightRange.min}_${heightRange.max}_` : '';
 
     return builder
         .setTitle(`${ANALYZER_INFO.name}报告${titleRange}`)
