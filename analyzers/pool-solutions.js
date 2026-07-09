@@ -112,6 +112,10 @@ function normHash(h) {
     return h.toLowerCase().replace(/^0x/, '');
 }
 
+function fmtIsoMs(ms) {
+    return ms != null ? new Date(ms).toISOString() : null;
+}
+
 function minMax(values) {
     let min = Infinity;
     let max = -Infinity;
@@ -197,7 +201,7 @@ function forEachNdjsonLineSync(filePath, onLine) {
     }
 }
 
-function parsePoolSolutionLine(line, idx) {
+function parsePoolSolutionLine(line, idx, opts = {}) {
     let e;
     try { e = JSON.parse(line); }
     catch { console.error(`第 ${idx} 行 JSON 解析失败: ${line.slice(0, 500)}`); return null; }
@@ -214,17 +218,34 @@ function parsePoolSolutionLine(line, idx) {
     const header_off_s = (e.header_timestamp != null && e2_ms != null)
         ? e.header_timestamp - Math.floor(e2_ms / 1000) : null;
 
+    if (opts.compact) {
+        return {
+            idx,
+            pool_submit_ms,
+            block_height: e.block_height ?? null,
+            block_hash: normHash(e.block_hash),
+            prev_hash: normHash(e.prev_hash),
+            pool_signature: e.pool_signature ?? null,
+            difficulty: nbits_to_difficulty(e.nbits),
+            hashrate_10min_hs: e.hashrate_10min_hs ?? null,
+            hashrate_total_hs: e.hashrate_total_hs ?? null,
+            channel_id: e.channel_id ?? null,
+            finding_s,
+            header_off_s,
+        };
+    }
+
     return {
         idx,
         pool_submit_time: e.pool_submit_time ?? null,
         pool_submit_ms,
-        pool_submit_iso: pool_submit_ms != null ? new Date(pool_submit_ms).toISOString() : null,
+        pool_submit_iso: fmtIsoMs(pool_submit_ms),
         utc_e2: e.utc_e2 ?? null,
         e2_ms,
-        e2_iso: e2_ms != null ? new Date(e2_ms).toISOString() : null,
+        e2_iso: fmtIsoMs(e2_ms),
         header_timestamp: e.header_timestamp ?? null,
         header_ms,
-        header_iso: header_ms != null ? new Date(header_ms).toISOString() : null,
+        header_iso: fmtIsoMs(header_ms),
         extranonce1: e.extranonce1 ?? null,
         block_height: e.block_height ?? null,
         block_hash: e.block_hash ?? null,
@@ -268,7 +289,7 @@ function loadSolutionInput(filePath, opts = {}) {
     forEachNdjsonLineSync(filePath, (line, lineNo) => {
         if (!line.trim()) return;
         totalRecords++;
-        const rec = parsePoolSolutionLine(line, lineNo);
+        const rec = parsePoolSolutionLine(line, lineNo, { compact: !keepRecords });
         if (!rec) return;
         parsedRecords++;
         mergeByHash(byHash, rec);
@@ -330,38 +351,40 @@ function buildChainView(records) {
 
 function buildChainViewFromByHash(byHash) {
     const norm = normHash;
-    const unique = [...byHash.values()];
 
     // 2) 按高度分组（去重后）：同高度多个不同 hash = 真实竞争
     const byHeight = new Map();
-    for (const r of unique) {
+    const pools = new Set();
+    let minHeight = Infinity;
+    let maxHeight = -Infinity;
+    let uniqueCount = 0;
+    for (const r of byHash.values()) {
+        uniqueCount++;
         if (!byHeight.has(r.block_height)) byHeight.set(r.block_height, []);
         byHeight.get(r.block_height).push(r);
-    }
-    const pools = new Set();
-    for (const r of unique) for (const p of (r._pools || [])) pools.add(p);
-
-    if (unique.length === 0) {
-        return { chain: [], byHeight, orphans: [], competitionHeights: [], interrupted: null, pools };
+        for (const p of (r._pools || [])) pools.add(p);
+        if (r.block_height < minHeight) minHeight = r.block_height;
+        if (r.block_height > maxHeight) maxHeight = r.block_height;
     }
 
-    // 3) 从最高高度回溯
-    const heightRange = minMax(unique.map(r => r.block_height));
-    const maxHeight = heightRange.max, minHeight = heightRange.min;
-    const hashIndex = new Map(unique.map(r => [norm(r.block_hash), r]));
+    if (uniqueCount === 0) {
+        return { chain: [], byHeight, orphans: { length: 0 }, competitionHeights: [], interrupted: null, pools };
+    }
+
+    // 3) 从最高高度回溯。byHash 本身就是 block_hash -> record 的索引，避免再复制一份 hashIndex。
     const walkBack = (tip) => {
         const path = [], seen = new Set();
         let cur = tip;
         while (cur && !seen.has(norm(cur.block_hash))) {
             path.push(cur);
             seen.add(norm(cur.block_hash));
-            cur = cur.prev_hash ? hashIndex.get(norm(cur.prev_hash)) : null;
+            cur = cur.prev_hash ? byHash.get(norm(cur.prev_hash)) : null;
         }
         return path; // tip → … → 最早可达块
     };
     // 链尖 = 最高高度的块；若并列竞争，取能回溯最长的一条
     let best = [];
-    for (const tip of unique.filter(r => r.block_height === maxHeight)) {
+    for (const tip of byHeight.get(maxHeight) || []) {
         const p = walkBack(tip);
         if (p.length > best.length) best = p;
     }
@@ -383,11 +406,15 @@ function buildChainViewFromByHash(byHash) {
     }
 
     // 5) 孤块 / 竞争高度 / 中断
-    const orphans = unique.filter(r => !onChain.has(norm(r.block_hash)));
-    for (const r of orphans) {
-        r.isWinner = false; r.isOrphan = true; r.winnerKnown = true; r.interval_s = null;
-        r.solutionCount = (byHeight.get(r.block_height) || []).length;
-        r.isMultiSolution = r.solutionCount > 1;
+    let orphanCount = 0;
+    for (const r of byHash.values()) {
+        if (onChain.has(norm(r.block_hash))) continue;
+        orphanCount++;
+        if (orphanCount <= 200) {
+            r.isWinner = false; r.isOrphan = true; r.winnerKnown = true; r.interval_s = null;
+            r.solutionCount = (byHeight.get(r.block_height) || []).length;
+            r.isMultiSolution = r.solutionCount > 1;
+        }
     }
     const competitionHeights = [...byHeight.entries()]
         .filter(([, g]) => g.length > 1).map(([h]) => h).sort((a, b) => a - b);
@@ -396,7 +423,7 @@ function buildChainViewFromByHash(byHash) {
     const interrupted = (chainMin != null && chainMin > minHeight)
         ? { gapBelow: chainMin, dataLow: minHeight } : null;
 
-    return { chain, byHeight, orphans, competitionHeights, interrupted, pools };
+    return { chain, byHeight, orphans: { length: orphanCount }, competitionHeights, interrupted, pools };
 }
 
 // ============ 异常判定（基线公式，可迭代）============
@@ -483,7 +510,7 @@ function analyzePoolSolutions(config = {}) {
             console.log(`   高度 ${h} (${group.length} 解):`);
             for (const r of group) {
                 const tag = r.isWinner ? '✅胜出' : (r.winnerKnown ? '⛔孤块' : '❔未决');
-                console.log(`     ${tag} hash=…${(normHash(r.block_hash) || '').slice(-16)} submit=${r.pool_submit_iso} ch=${r.channel_id}`);
+                console.log(`     ${tag} hash=…${(normHash(r.block_hash) || '').slice(-16)} submit=${fmtIsoMs(r.pool_submit_ms)} ch=${r.channel_id}`);
             }
         }
     }
@@ -543,7 +570,7 @@ function printTable(chain, limit = 200) {
 
     const cols = [
         { key: 'block_height', label: '高度',        width: 8  },
-        { key: 'pool_submit_iso', label: '上块时间(UTC)', width: 26 },
+        { key: 'pool_submit_ms', label: '上块时间(UTC)', width: 26, fmt: v => fmtIsoMs(v) || '-' },
         { key: 'interval_s',   label: '间隔s',       width: 8, fmt: v => v == null ? '-' : v.toFixed(0) },
         { key: 'finding_s',    label: '找块s',       width: 8, fmt: v => v == null ? '-' : v.toFixed(0) },
         { key: 'header_off_s', label: 'hdr偏移s',    width: 9, fmt: v => v == null ? '-' : v.toFixed(0) },
