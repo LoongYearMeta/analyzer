@@ -30,6 +30,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { StringDecoder } = require('string_decoder');
 const { analyze } = require('../lib/stats');
 const { HTMLChartBuilder } = require('../lib/charts');
 
@@ -51,6 +52,7 @@ const ANALYZER_INFO = {
         { name: 'cross-pool', type: 'boolean', description: '显示基于 share 的算力图（"实测网络算力" + "跨池总算力"）；默认隐藏（share 法受 translator vardiff 影响偏低，算力以出块速率反推为准）', default: false },
         { name: 'include-gaps', type: 'boolean', description: '把大缺口(停机/断链)也计入泊松计数 D（默认剔除，仅统计在线期；开启后所有异常数据进入计算）', default: false },
         { name: 'gap-threshold', type: 'number', description: '大缺口阈值秒数，超过即判为停机/断链（默认 max(窗口×3, 3600)）' },
+        { name: 'table-limit', type: 'number', description: '终端表格最多显示多少条 canonical 链记录；0 表示全部（默认 200）', default: 200 },
     ]
 };
 
@@ -160,60 +162,124 @@ function quantifyDeviation(validIntervals, stats) {
 
 // ============ 数据加载 ============
 
-function loadRecords(filePath) {
+function forEachNdjsonLineSync(filePath, onLine) {
     if (!fs.existsSync(filePath)) {
         throw new Error(`NDJSON 文件不存在: ${filePath}\n请先运行 pool（会自动写入 pool-solutions.ndjson）`);
     }
-    const raw = fs.readFileSync(filePath, 'utf8');
-    const lines = raw.split('\n').filter(l => l.trim());
 
-    return lines.map((line, idx) => {
-        let e;
-        try { e = JSON.parse(line); }
-        catch { console.error(`第 ${idx + 1} 行 JSON 解析失败: ${line}`); return null; }
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.allocUnsafe(1024 * 1024);
+    const decoder = new StringDecoder('utf8');
+    let pending = '';
+    let lineNo = 0;
 
-        const pool_submit_ms = parseSubmitMs(e.pool_submit_time);
-        const e2_ms          = parseE2Ms(e.utc_e2);
-        const header_ms      = e.header_timestamp != null ? e.header_timestamp * 1000 : null;
+    try {
+        while (true) {
+            const n = fs.readSync(fd, buf, 0, buf.length, null);
+            if (n === 0) break;
+            pending += decoder.write(buf.subarray(0, n));
+            let start = 0;
+            let nl;
+            while ((nl = pending.indexOf('\n', start)) !== -1) {
+                lineNo++;
+                onLine(pending.slice(start, nl), lineNo);
+                start = nl + 1;
+            }
+            pending = pending.slice(start);
+        }
+        pending += decoder.end();
+        if (pending.trim()) {
+            lineNo++;
+            onLine(pending, lineNo);
+        }
+    } finally {
+        fs.closeSync(fd);
+    }
+}
 
-        // 找块时间 = 上块时间 − 矿机开挖时间（秒）
-        const finding_s = (pool_submit_ms != null && e2_ms != null)
-            ? (pool_submit_ms - e2_ms) / 1000 : null;
-        // header 相对 e2 起挖时间的偏移（秒）；≈0 表示 header 在开挖时设定、与 e2 重合。
-        // header_timestamp 只有整秒精度，必须把 e2 也截断到整秒再比较——否则 ms 值减整秒会产生
-        // 亚秒级假负值（如 header=...651s 减 e2=...651.607s = −0.607s，纯属精度不对齐）。
-        const header_off_s = (e.header_timestamp != null && e2_ms != null)
-            ? e.header_timestamp - Math.floor(e2_ms / 1000) : null;
+function parsePoolSolutionLine(line, idx) {
+    let e;
+    try { e = JSON.parse(line); }
+    catch { console.error(`第 ${idx} 行 JSON 解析失败: ${line.slice(0, 500)}`); return null; }
 
-        return {
-            idx: idx + 1,
-            pool_submit_time: e.pool_submit_time ?? null,
-            pool_submit_ms,
-            pool_submit_iso: pool_submit_ms != null ? new Date(pool_submit_ms).toISOString() : null,
-            utc_e2: e.utc_e2 ?? null,
-            e2_ms,
-            e2_iso: e2_ms != null ? new Date(e2_ms).toISOString() : null,
-            header_timestamp: e.header_timestamp ?? null,
-            header_ms,
-            header_iso: header_ms != null ? new Date(header_ms).toISOString() : null,
-            extranonce1: e.extranonce1 ?? null,
-            block_height: e.block_height ?? null,
-            block_hash: e.block_hash ?? null,
-            prev_hash: e.prev_hash ?? null,
-            pool_signature: e.pool_signature ?? null,
-            nbits: e.nbits ?? null,
-            difficulty: nbits_to_difficulty(e.nbits),
-            hashrate_10min_hs: e.hashrate_10min_hs ?? null,
-            hashrate_total_hs: e.hashrate_total_hs ?? null,
-            nonce: e.nonce ?? null,
-            version: e.version ?? null,
-            job_id: e.job_id ?? null,
-            channel_id: e.channel_id ?? null,
-            template_id: e.template_id ?? null,
-            finding_s,
-            header_off_s,
-        };
-    }).filter(Boolean);
+    const pool_submit_ms = parseSubmitMs(e.pool_submit_time);
+    const e2_ms          = parseE2Ms(e.utc_e2);
+    const header_ms      = e.header_timestamp != null ? e.header_timestamp * 1000 : null;
+
+    // 找块时间 = 上块时间 − 矿机开挖时间（秒）
+    const finding_s = (pool_submit_ms != null && e2_ms != null)
+        ? (pool_submit_ms - e2_ms) / 1000 : null;
+    // header 相对 e2 起挖时间的偏移（秒）；≈0 表示 header 在开挖时设定、与 e2 重合。
+    // header_timestamp 只有整秒精度，必须把 e2 也截断到整秒再比较。
+    const header_off_s = (e.header_timestamp != null && e2_ms != null)
+        ? e.header_timestamp - Math.floor(e2_ms / 1000) : null;
+
+    return {
+        idx,
+        pool_submit_time: e.pool_submit_time ?? null,
+        pool_submit_ms,
+        pool_submit_iso: pool_submit_ms != null ? new Date(pool_submit_ms).toISOString() : null,
+        utc_e2: e.utc_e2 ?? null,
+        e2_ms,
+        e2_iso: e2_ms != null ? new Date(e2_ms).toISOString() : null,
+        header_timestamp: e.header_timestamp ?? null,
+        header_ms,
+        header_iso: header_ms != null ? new Date(header_ms).toISOString() : null,
+        extranonce1: e.extranonce1 ?? null,
+        block_height: e.block_height ?? null,
+        block_hash: e.block_hash ?? null,
+        prev_hash: e.prev_hash ?? null,
+        pool_signature: e.pool_signature ?? null,
+        nbits: e.nbits ?? null,
+        difficulty: nbits_to_difficulty(e.nbits),
+        hashrate_10min_hs: e.hashrate_10min_hs ?? null,
+        hashrate_total_hs: e.hashrate_total_hs ?? null,
+        nonce: e.nonce ?? null,
+        version: e.version ?? null,
+        job_id: e.job_id ?? null,
+        channel_id: e.channel_id ?? null,
+        template_id: e.template_id ?? null,
+        finding_s,
+        header_off_s,
+    };
+}
+
+function mergeByHash(byHash, r) {
+    if (r.block_height == null || !r.block_hash) return;
+    const key = normHash(r.block_hash);
+    const ex = byHash.get(key);
+    if (!ex) {
+        byHash.set(key, { ...r, _pools: new Set(r.pool_signature != null ? [r.pool_signature] : []) });
+    } else {
+        if (r.pool_signature != null) ex._pools.add(r.pool_signature);
+        if (r.pool_submit_ms != null && (ex.pool_submit_ms == null || r.pool_submit_ms < ex.pool_submit_ms)) {
+            byHash.set(key, { ...r, _pools: ex._pools });
+        }
+    }
+}
+
+function loadSolutionInput(filePath, opts = {}) {
+    const keepRecords = !!opts.keepRecords;
+    const records = keepRecords ? [] : null;
+    const byHash = new Map();
+    let totalRecords = 0;
+    let parsedRecords = 0;
+
+    forEachNdjsonLineSync(filePath, (line, lineNo) => {
+        if (!line.trim()) return;
+        totalRecords++;
+        const rec = parsePoolSolutionLine(line, lineNo);
+        if (!rec) return;
+        parsedRecords++;
+        mergeByHash(byHash, rec);
+        if (records) records.push(rec);
+    });
+
+    return { records, byHash, totalRecords, parsedRecords };
+}
+
+function loadRecords(filePath) {
+    return loadSolutionInput(filePath, { keepRecords: true }).records;
 }
 
 // ============ prev_hash 传播时序加载（pool-prevhash.ndjson，可选）============
@@ -221,12 +287,25 @@ function loadRecords(filePath) {
 // pool 在每次链 tip 变更时记一行：从 TP 收到新 prev_hash 到向矿机下发 SetNewPrevHash
 // 的延迟 stale_ms（矿机这段时间在旧 prev_hash 上挖无效工作）。文件不存在则返回空。
 function loadPrevhashRecords(filePath) {
+    const MAX_PREVHASH_POINTS = 5000;
     try {
         if (!filePath || !fs.existsSync(filePath)) return [];
-        const raw = fs.readFileSync(filePath, 'utf8');
-        return raw.split('\n').filter(l => l.trim()).map(l => {
-            try { return JSON.parse(l); } catch { return null; }
-        }).filter(Boolean);
+        const ring = [];
+        let total = 0;
+        forEachNdjsonLineSync(filePath, (line) => {
+            if (!line.trim()) return;
+            let rec;
+            try { rec = JSON.parse(line); } catch { return; }
+            total++;
+            if (ring.length < MAX_PREVHASH_POINTS) ring.push(rec);
+            else ring[(total - 1) % MAX_PREVHASH_POINTS] = rec;
+        });
+        const ordered = total > MAX_PREVHASH_POINTS
+            ? ring.slice(total % MAX_PREVHASH_POINTS).concat(ring.slice(0, total % MAX_PREVHASH_POINTS))
+            : ring;
+        ordered.totalRecords = total;
+        ordered.sampled = total > ordered.length;
+        return ordered;
     } catch { return []; }
 }
 
@@ -241,23 +320,16 @@ function loadPrevhashRecords(filePath) {
 //   4) 高度-时间反向校验：canonical 链上更高高度的 pool_submit_time 不应早于更低高度，
 //      违反即异常（链溯错 / 时钟回拨）——表现为相邻 interval ≤ 0，由 flagAnomalies 标出。
 function buildChainView(records) {
-    const norm = normHash;
-
     // 1) 去重：同 block_hash 合并，取最早 pool_submit_ms 的那条，累计 pool_signature
     const byHash = new Map();
     for (const r of records) {
-        if (r.block_height == null || !r.block_hash) continue;
-        const key = norm(r.block_hash);
-        const ex = byHash.get(key);
-        if (!ex) {
-            byHash.set(key, { ...r, _pools: new Set(r.pool_signature != null ? [r.pool_signature] : []) });
-        } else {
-            if (r.pool_signature != null) ex._pools.add(r.pool_signature);
-            if (r.pool_submit_ms != null && (ex.pool_submit_ms == null || r.pool_submit_ms < ex.pool_submit_ms)) {
-                byHash.set(key, { ...r, _pools: ex._pools });
-            }
-        }
+        mergeByHash(byHash, r);
     }
+    return buildChainViewFromByHash(byHash);
+}
+
+function buildChainViewFromByHash(byHash) {
+    const norm = normHash;
     const unique = [...byHash.values()];
 
     // 2) 按高度分组（去重后）：同高度多个不同 hash = 真实竞争
@@ -357,13 +429,15 @@ function analyzePoolSolutions(config = {}) {
     console.log(`\n📋 ${ANALYZER_INFO.icon} ${ANALYZER_INFO.name}`);
     console.log(`   数据来源: ${filePath}\n`);
 
-    const records = loadRecords(filePath);
-    if (records.length === 0) {
+    const keepRecords = !!(config.json || config.csv || config.crossPool);
+    const input = loadSolutionInput(filePath, { keepRecords });
+    const records = input.records || [];
+    if (input.parsedRecords === 0) {
         console.log('  (文件为空，尚无出块记录)');
         return { info: ANALYZER_INFO, records: [] };
     }
 
-    const { chain, byHeight, orphans, competitionHeights, interrupted, pools } = buildChainView(records);
+    const { chain, byHeight, orphans, competitionHeights, interrupted, pools } = buildChainViewFromByHash(input.byHash);
 
     // 出块间隔统计（仅有效正间隔）
     const intervals = chain.map(c => c.interval_s).filter(v => v != null);
@@ -379,7 +453,8 @@ function analyzePoolSolutions(config = {}) {
     // 与 BTC 泊松出块的偏离量化
     const dev = validIntervals.length >= 2 ? quantifyDeviation(validIntervals, stats) : null;
 
-    console.log(`   记录数: ${records.length} | 去重区块: ${byHeight.size} | canonical链: ${chain.length} | 竞争高度: ${competitionHeights.length} | 孤块: ${orphans.length} | 矿池数: ${pools.size}`);
+    const retentionNote = keepRecords ? '' : ' | 原始记录: 流式聚合未保留';
+    console.log(`   记录数: ${input.totalRecords} | 可解析: ${input.parsedRecords} | 去重区块: ${byHeight.size} | canonical链: ${chain.length} | 竞争高度: ${competitionHeights.length} | 孤块: ${orphans.length} | 矿池数: ${pools.size}${retentionNote}`);
     if (interrupted) {
         console.log(`   ⛓️‍💥 链中断: 仅回溯到高度 ${interrupted.gapBelow}，其下至 ${interrupted.dataLow} 未能连上（断点在 ${interrupted.gapBelow - 1}）`);
     }
@@ -400,7 +475,7 @@ function analyzePoolSolutions(config = {}) {
         console.log(`   实测算力(最新出块): 10分钟 ${(hrRec.hashrate_10min_hs / 1e12).toFixed(2)} TH/s | 累计 ${(hrRec.hashrate_total_hs / 1e12).toFixed(2)} TH/s`);
     }
     console.log('');
-    printTable(chain);
+    printTable(chain, config.tableLimit == null ? 200 : config.tableLimit);
 
     if (multiHeights.length) {
         console.log(`\n⚔️  多解竞争高度:`);
@@ -444,7 +519,8 @@ function analyzePoolSolutions(config = {}) {
             || path.join(path.dirname(filePath), 'pool-prevhash.ndjson');
         const prevhashRecs = loadPrevhashRecords(prevhashPath);
         if (prevhashRecs.length) {
-            console.log(`   prev_hash 传播记录: ${prevhashRecs.length} 条 (${prevhashPath})`);
+            const sampleNote = prevhashRecs.sampled ? `，图表使用最近 ${prevhashRecs.length} 条` : '';
+            console.log(`   prev_hash 传播记录: ${prevhashRecs.totalRecords || prevhashRecs.length} 条${sampleNote} (${prevhashPath})`);
         }
         const p = buildHTML(records, chain, byHeight, stats, mu, dev, outDir, prevhashRecs,
             { orphans, competitionHeights, interrupted, pools,
@@ -453,13 +529,17 @@ function analyzePoolSolutions(config = {}) {
         console.log(`\n📄 HTML 报告: ${p}`);
     }
 
-    return { info: ANALYZER_INFO, records, chain, byHeight, stats };
+    return { info: ANALYZER_INFO, records, recordCount: input.totalRecords, chain, byHeight, stats };
 }
 
 // ============ 控制台表格 ============
 
-function printTable(chain) {
+function printTable(chain, limit = 200) {
     if (!chain.length) { console.log('  (无记录)'); return; }
+    const rowsToPrint = limit > 0 && chain.length > limit ? chain.slice(-limit) : chain;
+    if (rowsToPrint.length < chain.length) {
+        console.log(`   canonical链共 ${chain.length} 条，终端表格仅显示最后 ${rowsToPrint.length} 条（--table-limit 0 可显示全部）`);
+    }
 
     const cols = [
         { key: 'block_height', label: '高度',        width: 8  },
@@ -479,7 +559,7 @@ function printTable(chain) {
     console.log(`|${hdr}|`);
     console.log(`+${sep}+`);
 
-    for (const r of chain) {
+    for (const r of rowsToPrint) {
         const status = r.isMultiSolution
             ? (r.isWinner ? '多解✅' : (r.winnerKnown ? '多解⛔' : '多解❔'))
             : '单解';
@@ -979,6 +1059,7 @@ function parseArgs() {
             case '--cross-pool':      config.crossPool = true; break;
             case '--include-gaps':    config.includeGaps = true; break;
             case '--gap-threshold':   config.gapThreshold = parseInt(args[++i], 10); break;
+            case '--table-limit':     config.tableLimit = parseInt(args[++i], 10); break;
             case '--html':            config.html = true;      break;
             case '--json':            config.json = true;      break;
             case '--csv':             config.csv  = true;      break;
