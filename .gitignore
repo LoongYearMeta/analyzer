@@ -3,8 +3,6 @@ reports/
 
 # 依赖
 node_modules/
-package.json
-package-lock.json
 
 # Python 虚拟环境
 .venv/

@@ -1,0 +1,16 @@
+{
+  "name": "chain-analyzer",
+  "version": "1.0.0",
+  "description": "Chain data analysis framework",
+  "main": "framework.js",
+  "scripts": {
+    "start": "node framework.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^9.4.0",
+    "zeromq": "^6.0.0"
+  }
+}
